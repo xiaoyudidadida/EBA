@@ -180,26 +180,42 @@ class ReliabilityScorer(nn.Module):
         return g_bar_t, g_bar_a, g_bar_v
 
     def forward(self, u_dict: dict, s_dict: dict = None):
-        u_t, u_a, u_v = u_dict.get('t'), u_dict.get('a'), u_dict.get('v')
+        device = next(iter(u_dict.values())).device
+        N = next(iter(u_dict.values())).size(0)
 
-        q_t = self._compute_quality(u_t)
-        q_a = self._compute_quality(u_a)
-        q_v = self._compute_quality(u_v)
+        # 动态收集存在的模态
+        alpha_list = []
+        r_dict = {}
 
-        g_bar_t, g_bar_a, g_bar_v = self._compute_cross_similarity(u_t, u_a, u_v)
+        for m in ['t', 'a', 'v']:
+            u = u_dict.get(m)
+            if u is not None:
+                q_m = self._compute_quality(u)
 
-        r_t = self.scorer_t(torch.cat([g_bar_t, q_t], dim=-1))
-        r_a = self.scorer_a(torch.cat([g_bar_a, q_a], dim=-1))
-        r_v = self.scorer_v(torch.cat([g_bar_v, q_v], dim=-1))
+                # 计算与其余存在的模态的平均相似度
+                g_bar_m = torch.zeros_like(q_m)
+                count = 0
+                u_norm = F.normalize(u, dim=-1)
+                for other_m in ['t', 'a', 'v']:
+                    if other_m != m and other_m in u_dict:
+                        other_u_norm = F.normalize(u_dict[other_m], dim=-1)
+                        sim = (u_norm * other_u_norm).sum(dim=-1, keepdim=True)
+                        g_bar_m += sim
+                        count += 1
+                if count > 0:
+                    g_bar_m = g_bar_m / count
 
-        # 【核心修改 1】：废弃 Softmax，使用独立 Sigmoid 门控
-        alpha_t = torch.sigmoid(r_t)
-        alpha_a = torch.sigmoid(r_a)
-        alpha_v = torch.sigmoid(r_v)
+                scorer = getattr(self, f'scorer_{m}')
+                r_m = scorer(torch.cat([g_bar_m, q_m], dim=-1))
+                alpha_m = torch.sigmoid(r_m)
 
-        # 拼接 [N, 3]
-        alpha = torch.cat([alpha_t, alpha_a, alpha_v], dim=-1)
-        r_dict = {'t': r_t, 'a': r_a, 'v': r_v}
+                alpha_list.append(alpha_m)
+                r_dict[m] = r_m
+            else:
+                # 填充 dummy 占位符以保持维度对齐（如果下游需要固定的特征拼接）
+                alpha_list.append(torch.zeros(N, 1, device=device))
+
+        alpha = torch.cat(alpha_list, dim=-1)  # 始终保证返回 [N, 3] 结构供下游索引
         return alpha, r_dict
 
 
@@ -265,8 +281,8 @@ class ResidualReliabilityAlignment(nn.Module):
         L_align = self._compute_rra_loss(u_dict, s_dict) if self.use_align_loss else torch.tensor(0.0, device=next(iter(p_dict.values())).device)
 
         if return_align_loss:
-            return h_tilde_dict, L_align
-        return h_tilde_dict
+            return h_tilde_dict, L_align, alpha  # 新增返回 alpha
+        return h_tilde_dict, alpha
 
     def _compute_rra_loss(self, u_dict: dict, s_dict: dict):
         """
@@ -329,198 +345,143 @@ class ResidualReliabilityAlignment(nn.Module):
 # ============================================================================
 
 
-class MultiCenterEmotionBall(nn.Module):
+class AngularMultiCenterEmotionBall(nn.Module):
     """
-    严格遵循 SGF-RRA-MEB 计划书的 Emotion Ball 模块 (Euclidean MEB)
-    纯辅助损失模块，不改变 SGF 主干的特征空间，解决高维数值爆炸问题。
+    基于单位超球面 (Unit Hypersphere) 和角距离 (Angular Distance) 的 MEB 模块。
+    彻底解决高维欧氏空间距离爆炸问题，并支持 RRA 传导的置信度加权。
     """
 
-    def __init__(self, z_dim: int, n_classes: int, ball_dim: int = None,
-                 K_per_class: int = 2, tau_b: float = 1.0,  # 提高初始温度
-                 margin_m: float = 1.0, eta: float = 1.0,
-                 dropout: float = 0.3,
-                 lambda_in: float = 1.0, lambda_ov: float = 1.0,
-                 lambda_div: float = 0.5):
+    def __init__(self, z_dim: int, n_classes: int, K_per_class: int = 2,
+                 tau_b: float = 0.1, dropout: float = 0.3):
         super().__init__()
         self.z_dim = z_dim
         self.n_classes = n_classes
-        self.ball_dim = ball_dim if ball_dim is not None else z_dim
         self.K = K_per_class
-        self.tau_b = tau_b
-        self.margin_m = margin_m
-        self.eta = eta
-        self.lambda_in = lambda_in
-        self.lambda_ov = lambda_ov
-        self.lambda_div = lambda_div
+        self.tau_b = tau_b  # 温度系数需要调小，因为 Cosine 范围在 [-1, 1]
 
-        # 可学习的球心参数: [n_classes, K_per_class, ball_dim]
-        self.ball_centers = nn.Parameter(
-            torch.randn(n_classes, K_per_class, self.ball_dim) * 0.1
-        )
+        # 可学习的球心参数: [n_classes, K, z_dim]
+        self.ball_centers = nn.Parameter(torch.randn(n_classes, K_per_class, z_dim))
 
-        # 可学习的初始半径: [n_classes, K_per_class]
-        self.ball_radii = nn.Parameter(
-            torch.ones(n_classes, K_per_class) * 0.5
-        )
-
-        self.proj_head = nn.Sequential(
-            nn.Linear(self.z_dim, self.z_dim),
-            nn.BatchNorm1d(self.z_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.z_dim, self.ball_dim)
-        )
+        # 初始角度半径 R (约束在 0 到 1 之间，代表 1-cos(theta) 的容忍度)
+        self.ball_radii = nn.Parameter(torch.ones(n_classes, K_per_class) * 0.2)
 
         self.dropout = nn.Dropout(dropout)
-
-        self.register_buffer('ema_radii', torch.ones(n_classes, K_per_class) * 0.5)
+        self.register_buffer('ema_radii', torch.ones(n_classes, K_per_class) * 0.2)
         self.ema_momentum = 0.99
         self._is_initialized = False
 
     def _init_ball_centers_kmeans(self, z_features: torch.Tensor, labels: torch.Tensor):
-        """用当前 Batch 的特征初始化球心，确保与 SGF 特征空间对齐"""
-        device = self.ball_centers.device
+        z_norm = F.normalize(z_features, dim=-1)
         with torch.no_grad():
             for k in range(self.n_classes):
                 mask = (labels == k)
-                if mask.sum() < 1:
-                    continue
-                feats_k = z_features[mask]
-
+                if mask.sum() < 1: continue
+                feats_k = z_norm[mask]
                 if feats_k.size(0) <= self.K:
-                    center = feats_k.mean(dim=0, keepdim=True)
-                    self.ball_centers.data[k, :1] = center
+                    self.ball_centers.data[k, :1] = feats_k.mean(dim=0, keepdim=True)
                 else:
-                    idx = torch.randperm(feats_k.size(0), device=device)[:self.K]
+                    idx = torch.randperm(feats_k.size(0), device=feats_k.device)[:self.K]
                     self.ball_centers.data[k] = feats_k[idx]
 
     def forward(self, z: torch.Tensor, labels: torch.Tensor = None,
-                update_radii: bool = True, return_loss: bool = True):
+                sample_rel: torch.Tensor = None, update_radii: bool = True):
 
-        z_proj = self.proj_head(z)
-        z_proj = self.dropout(z_proj)
+        z_dropped = self.dropout(z)
 
-        L_meb = None
-        if return_loss and labels is not None:
-            # 在子空间中计算所有粒球损失 (L_intra, L_overlap, L_div)
-            L_meb_dict = self._compute_meb_loss(z_proj, labels, update_radii)
-            L_meb = L_meb_dict['total']
+        L_meb_dict = {'total': torch.tensor(0.0, device=z.device)}
+        if labels is not None:
+            L_meb_dict = self._compute_angular_meb_loss(z_dropped, labels, sample_rel, update_radii)
 
-        # 【核心修正】：绝对隔离。完全丢弃原代码中的 z_enhanced = z + 0.01 * z_proj
-        # MEB 只产生 Loss 约束编码器，绝不在正向传播中物理污染 SGF 的核心特征 z
-        z_enhanced = z
+        # 保持前向特征原样输出，MEB 仅提供 Loss 梯度约束 Backbone
+        return z, L_meb_dict
 
-        return z_enhanced, L_meb
+    def _compute_angular_meb_loss(self, z: torch.Tensor, labels: torch.Tensor,
+                                  sample_rel: torch.Tensor, update_radii: bool):
+        device = z.device
+        batch_size = z.size(0)
 
-    def _compute_meb_loss(self, z_ball: torch.Tensor, labels: torch.Tensor,
-                          update_radii: bool = True):
-        device = z_ball.device
-        batch_size = z_ball.size(0)
+        # 【核心 1】：投影到单位超球面
+        z_norm = F.normalize(z, dim=-1)
+        c_norm = F.normalize(self.ball_centers, dim=-1)  # [n_classes, K, dim]
 
-        # 1. 维度缩放因子 (防止高维欧式距离爆炸)
-        scale_factor = self.ball_dim / 10.0
+        # 确保半径物理意义合法 (角距离上限设为 1.0)
+        radii = torch.clamp(self.ball_radii.abs(), min=0.05, max=1.0)
 
-        # ---- 1) 软分配权重 q_{i,j} ----
-        q_all = []
-        for k in range(self.n_classes):
-            mask_k = (labels == k)
-            if mask_k.sum() == 0:
-                q_k = torch.zeros(batch_size, self.K, device=device)
-                q_all.append(q_k)
-                continue
+        # 如果没有传入置信度，默认全为 1
+        if sample_rel is None:
+            sample_rel = torch.ones(batch_size, 1, device=device)
 
-            z_k = z_ball[mask_k]
-            centers_k = self.ball_centers[k]
-
-            # 距离平方: [N_k, K]
-            dist_sq = torch.cdist(z_k, centers_k, p=2).pow(2)
-
-            # 【数值稳定化】将距离除以 scale_factor，防止 softmax 溢出
-            scaled_dist_sq = dist_sq / scale_factor
-            q_k = F.softmax(-scaled_dist_sq / self.tau_b, dim=-1)
-
-            q_full_k = torch.zeros(batch_size, self.K, device=device)
-            q_full_k[mask_k] = q_k
-            q_all.append(q_full_k)
-
-        q_matrix = torch.cat(q_all, dim=-1)
-
-        # ---- 2) 更新 EMA 半径 (带防爆截断) ----
-        if update_radii and self.training:
-            self._update_ema_radii(z_ball, labels, q_matrix)
-
-        # 保证半径为正，且限制最大值防止 L_overlap 无限扩张
-        radii = torch.clamp(self.ball_radii.abs(), min=0.1, max=5.0)
-
-        # ---- 3) L_intra: 类内紧凑 ----
+        # ---- 1) 计算所有样本到自身类别中心簇的相似度与软分配权重 ----
         L_intra = torch.tensor(0.0, device=device)
-        count_intra = 0
+        valid_count = 0
+
         for i in range(batch_size):
             k = labels[i].item()
-            z_i = z_ball[i:i + 1]
-            centers_k = self.ball_centers[k]
-            radii_k = radii[k]
+            z_i = z_norm[i:i + 1]  # [1, dim]
+            c_k = c_norm[k]  # [K, dim]
 
-            dist_sq_ik = ((z_i - centers_k) ** 2).sum(dim=-1)
-            q_ij = q_matrix[i, k * self.K:(k + 1) * self.K]
+            # 余弦相似度 [1, K]
+            sim_ik = torch.matmul(z_i, c_k.transpose(0, 1))
+            # 角距离 D = 1 - cos(theta)
+            dist_ik = 1.0 - sim_ik
 
-            dist_sq_w = (q_ij * dist_sq_ik).sum()
-            r_sq = (q_ij * (radii_k ** 2)).sum()
-            margin_sq = self.eta * r_sq
+            # 基于相似度计算软分配权重 softmax(sim / tau)
+            q_ik = F.softmax(sim_ik / self.tau_b, dim=-1).detach()  # [1, K]
 
-            # 按计划书公式: max(0, ||z-c||^2 - eta * R^2)
-            loss_i = F.relu(dist_sq_w - margin_sq)
+            # 加权角距离与加权半径
+            dist_w = (q_ik * dist_ik).sum()
+            r_w = (q_ik * radii[k:k + 1]).sum()
 
-            # 为了防止单个异常样本产生天文数字的 Loss，加入平滑裁剪
-            L_intra += torch.clamp(loss_i, max=50.0)
-            count_intra += 1
+            # 【核心 2】：引入 RRA 的置信度 sample_rel 调控 Loss 严苛度
+            # 高置信度样本受到严格约束，低置信度样本 Loss 被衰减
+            loss_i = sample_rel[i, 0] * F.relu(dist_w - r_w)
+            L_intra += loss_i
+            valid_count += 1
 
-        if count_intra > 0:
-            L_intra = L_intra / count_intra
+            # 动态更新 EMA 半径 (简化逻辑：向当前 batch 的加权距离滑动)
+            if update_radii and self.training:
+                with torch.no_grad():
+                    self.ema_radii[k] = self.ema_momentum * self.ema_radii[k] + \
+                                        (1 - self.ema_momentum) * dist_ik.squeeze(0)
 
-        # ---- 4) L_overlap: 类间防重叠 ----
-        L_overlap = torch.tensor(0.0, device=device)
-        count_overlap = 0
+        if valid_count > 0:
+            L_intra = L_intra / valid_count
+
+        if update_radii and self.training:
+            self.ball_radii.data = self.ema_radii.data.clone()
+
+        # ---- 2) L_overlap: 类间防重叠 (约束不同类别的球心) ----
+        # 要求不同类的球心余弦相似度不能大于 margin_ov (例如 0.3)
+        margin_ov = 0.3
+        c_flat = c_norm.view(self.n_classes * self.K, -1)
+        # 计算所有球心两两之间的余弦相似度矩阵 [n_classes*K, n_classes*K]
+        sim_matrix = torch.matmul(c_flat, c_flat.transpose(0, 1))
+
+        # 构造掩码，屏蔽同类球心之间的比较
+        mask = torch.ones_like(sim_matrix)
         for k in range(self.n_classes):
-            for p in range(self.K):
-                c_kp = self.ball_centers[k, p]
-                R_kp = radii[k, p]
-                for l in range(k, self.n_classes):
-                    start_q = p + 1 if l == k else 0
-                    for q in range(start_q, self.K):
-                        c_lq = self.ball_centers[l, q]
-                        R_lq = radii[l, q]
-                        dist_kp_lq = ((c_kp - c_lq) ** 2).sum().sqrt()
+            mask[k * self.K: (k + 1) * self.K, k * self.K: (k + 1) * self.K] = 0.0
 
-                        # 按计划书公式: max(0, R1 + R2 + m - ||c1-c2||)
-                        loss_ov = F.relu(R_kp + R_lq + self.margin_m - dist_kp_lq)
-                        L_overlap += loss_ov
-                        count_overlap += 1
+        # 仅惩罚相似度大于 margin_ov 的跨类球心
+        overlap_penalties = F.relu(sim_matrix - margin_ov) * mask
+        L_overlap = overlap_penalties.sum() / (mask.sum() + 1e-6)
 
-        if count_overlap > 0:
-            L_overlap = L_overlap / count_overlap
-
-        # ---- 5) L_div: 同类多球防塌缩 ----
-        delta = 2.0  # 欧式空间中最小球间距，需比归一化空间大
+        # ---- 3) L_div: 类内多球防塌缩 ----
+        # 同一类内的 K 个球心不能靠得太近，要求相似度小于 margin_div (例如 0.8)
+        margin_div = 0.8
         L_div = torch.tensor(0.0, device=device)
-        count_div = 0
-        for k in range(self.n_classes):
-            for p in range(self.K):
-                for q in range(p + 1, self.K):
-                    c_p = self.ball_centers[k, p]
-                    c_q = self.ball_centers[k, q]
-                    dist_pq = ((c_p - c_q) ** 2).sum().sqrt()
+        if self.K > 1:
+            div_count = 0
+            for k in range(self.n_classes):
+                for p in range(self.K):
+                    for q in range(p + 1, self.K):
+                        sim_pq = torch.dot(c_norm[k, p], c_norm[k, q])
+                        L_div += F.relu(sim_pq - margin_div)
+                        div_count += 1
+            L_div = L_div / div_count
 
-                    # 按计划书公式: max(0, delta - ||c1-c2||)
-                    loss_div = F.relu(delta - dist_pq)
-                    L_div += loss_div
-                    count_div += 1
-
-        if count_div > 0:
-            L_div = L_div / count_div
-
-        L_total = (self.lambda_in * L_intra +
-                   self.lambda_ov * L_overlap +
-                   self.lambda_div * L_div)
+        # 总损失融合
+        L_total = 1.0 * L_intra + 0.5 * L_overlap + 0.5 * L_div
 
         return {
             'total': L_total,

@@ -8,7 +8,7 @@ from torch_geometric.nn import GraphConv
 import numpy as np, itertools, random, copy, math
 from model_GCN import GCN_2Layers, GCNLayer1, GCNII, TextCNN
 from model_hyper import HyperGCN
-from emb import ResidualReliabilityAlignment, MultiCenterEmotionBall
+from emb import ResidualReliabilityAlignment, AngularMultiCenterEmotionBall as MultiCenterEmotionBall
 
 
 def print_grad(grad):
@@ -949,13 +949,8 @@ class Model(nn.Module):
                 z_dim=meb_input_dim,
                 n_classes=n_classes,
                 K_per_class=2,
-                tau_b=0.5,
-                margin_m=0.5,
-                eta=1.0,
-                dropout=self.dropout,
-                lambda_in=1.0,
-                lambda_ov=1.0,
-                lambda_div=0.5
+                tau_b=0.1,  # 注意：在 Cosine 空间，推荐的温度系数是 0.1
+                dropout=self.dropout
             )
 
     def _reverse_seq(self, X, mask):
@@ -974,7 +969,7 @@ class Model(nn.Module):
         # 默认 extra_loss 初始值（当 RRA/MEB 未启用时使用）
         L_align = torch.tensor(0.0, device=U.device) if hasattr(U, 'device') else torch.tensor(0.0)
         L_meb   = torch.tensor(0.0)
-
+        sample_rel = None
         # =============roberta features
         [r1, r2, r3, r4] = U
         seq_len, batch_size, feature_dim = r1.size()
@@ -1037,12 +1032,12 @@ class Model(nn.Module):
                 flat_Ua  = U_a.transpose(0, 1)[valid_mask]  if U_a is not None else None
                 flat_Uv  = U_v.transpose(0, 1)[valid_mask] if U_v is not None else None
 
-                # RRA: 只对有效位置做对齐和重标定
-                h_tilde_dict, L_align = self.rra(
+                # RRA: 只对有效位置做对齐和重标定,接受a
+                h_tilde_dict, L_align, alpha_rra = self.rra(
                     h_t=flat_U, h_a=flat_Ua, h_v=flat_Uv,
                     return_align_loss=True
                 )
-
+                sample_rel = alpha_rra.mean(dim=-1, keepdim=True)
                 # 预分配输出张量，padding 位置保持为 0
                 dim_t = h_tilde_dict['t'].size(-1)
                 dim_a = h_tilde_dict['a'].size(-1) if U_a is not None else 0
@@ -1189,13 +1184,14 @@ class Model(nn.Module):
                 L_meb = torch.tensor(0.0, device=emotions_feat.device)
 
                 if self.use_meb and self.meb is not None and labels is not None:
-                    # 修复空间错位：利用首个 Batch 的真实 Graph 融合特征 (emotions_feat) 进行初始化
                     if not getattr(self.meb, '_is_initialized', False):
                         self.meb._init_ball_centers_kmeans(emotions_feat.detach(), labels)
                         self.meb._is_initialized = True
 
                     emotions_feat_enhanced, L_meb_dict = self.meb(
-                        emotions_feat, labels=labels, update_radii=self.training
+                        emotions_feat, labels=labels,
+                        sample_rel=sample_rel.detach() if sample_rel is not None else None, # 新增传入置信度
+                        update_radii=self.training
                     )
                     L_meb = L_meb_dict['total']
                     # 将增强后的特征继续送入分类器
@@ -1219,7 +1215,9 @@ class Model(nn.Module):
                     self.meb._is_initialized = True
 
                 emotions_feat_enhanced, L_meb_dict = self.meb(
-                    emotions_feat, labels=labels, update_radii=self.training
+                    emotions_feat, labels=labels,
+                    sample_rel=sample_rel.detach() if sample_rel is not None else None,  # <--- 新增这行
+                    update_radii=self.training
                 )
                 if isinstance(L_meb_dict, dict):
                     L_meb = L_meb_dict['total']
