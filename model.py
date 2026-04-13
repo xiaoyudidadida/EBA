@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
@@ -98,17 +98,17 @@ class GraphNN(nn.Module):
 
     def forward(self, features, centroids):
         batch_size = features.shape[0]
-        device = features.device  # 修复：继承输入设备的属性
+        device = features.device  # 淇锛氱户鎵胯緭鍏ヨ澶囩殑灞炴€?
 
-        # 构建adj矩阵
+        # 鏋勫缓adj鐭╅樀
         matrix = torch.zeros([batch_size, centroids.shape[0] + 1, centroids.shape[0] + 1], device=device)
         matrix[:, -1:] = 1
         matrix[:, :, -1] = 1
 
-        # 得到每个图的节点表示
+        # 寰楀埌姣忎釜鍥剧殑鑺傜偣琛ㄧず
         feature = torch.zeros([batch_size, centroids.shape[0] + 1, self.gnn_dims[0]], device=device)
 
-        # 修复：移除低效的 Python for 循环，使用张量批量赋值
+        # 淇锛氱Щ闄や綆鏁堢殑 Python for 寰幆锛屼娇鐢ㄥ紶閲忔壒閲忚祴鍊?
         centroids_expanded = centroids.unsqueeze(0).expand(batch_size, -1, -1)
         feature[:, :-1, :] = centroids_expanded
         feature[:, -1, :] = features
@@ -533,12 +533,12 @@ class MaskedEdgeAttention(nn.Module):
             scale = self.scalar(M)
             alpha = F.softmax(scale, dim=0).permute(1, 2, 0)
 
-            # 修复：移除 Variable，直接使用设备相关的 tensor
+            # 淇锛氱Щ闄?Variable锛岀洿鎺ヤ娇鐢ㄨ澶囩浉鍏崇殑 tensor
             device = alpha.device
             mask = torch.ones_like(alpha) * 1e-10
             mask_copy = torch.zeros_like(alpha)
 
-            # 修复：优化 edge_ind 的提取过程
+            # 淇锛氫紭鍖?edge_ind 鐨勬彁鍙栬繃绋?
             edge_indices = []
             for i, j in enumerate(edge_ind):
                 for x in j:
@@ -546,13 +546,13 @@ class MaskedEdgeAttention(nn.Module):
 
             if len(edge_indices) > 0:
                 edge_ind_tensor = torch.tensor(edge_indices, device=device).t()
-                # 假设 edge_ind_tensor 的形状为 [3, num_edges]
+                # 鍋囪 edge_ind_tensor 鐨勫舰鐘朵负 [3, num_edges]
                 mask[edge_ind_tensor[0], edge_ind_tensor[1], edge_ind_tensor[2]] = 1.0
                 mask_copy[edge_ind_tensor[0], edge_ind_tensor[1], edge_ind_tensor[2]] = 1.0
 
             masked_alpha = alpha * mask
             _sums = masked_alpha.sum(-1, keepdim=True)
-            scores = masked_alpha.div(_sums + 1e-8) * mask_copy  # 增加 1e-8 防止除零异常
+            scores = masked_alpha.div(_sums + 1e-8) * mask_copy  # 澧炲姞 1e-8 闃叉闄ら浂寮傚父
 
             return scores
 
@@ -620,12 +620,12 @@ def simple_batch_graphify(features, lengths, no_cuda):
     seq_len, batch_size, dim = features.shape
     device = features.device
 
-    # 构建二维掩码 [batch_size, seq_len]
+    # 鏋勫缓浜岀淮鎺╃爜 [batch_size, seq_len]
     mask = torch.arange(seq_len, device=device).expand(batch_size, seq_len) < torch.tensor(lengths,
                                                                                            device=device).unsqueeze(1)
 
-    # PyTorch 布尔索引直接提取，一步到位
-    # 注意：需要先转置成 [batch_size, seq_len, dim] 以匹配掩码的展平顺序
+    # PyTorch 甯冨皵绱㈠紩鐩存帴鎻愬彇锛屼竴姝ュ埌浣?
+    # 娉ㄦ剰锛氶渶瑕佸厛杞疆鎴?[batch_size, seq_len, dim] 浠ュ尮閰嶆帺鐮佺殑灞曞钩椤哄簭
     node_features = features.transpose(0, 1)[mask]
 
     return node_features, None, None, None, None
@@ -749,10 +749,11 @@ class Model(nn.Module):
                  dynamic_edge_w=False, D_m_v=512, D_m_a=100, modals='avl', att_type='gated', av_using_lstm=False,
                  Deep_GCN_nlayers=64, dataset='IEMOCAP',
                  use_speaker=True, use_modal=False, norm='LN2', edge_ratio=0.9, num_convs=3, opn='corr', D_text=1024,
-                 use_rra=False, use_meb=False):
+                 use_rra=False, use_meb=False, use_dsu=True):
 
         super(Model, self).__init__()
-        self.dsu = DistributionUncertainty()
+        # Keep DSU p=0.5 as the primary setting from the original paper.
+        self.dsu = DistributionUncertainty(p=0.5)
         self.base_model = base_model
         self.avec = avec
         self.no_cuda = no_cuda
@@ -770,9 +771,10 @@ class Model(nn.Module):
         self.use_speaker = use_speaker
         self.use_modal = use_modal
         self.att_type = att_type
-        # ---- RRA / MEB 开关 ----
+        # ---- RRA / MEB 寮€鍏?----
         self.use_rra = use_rra
         self.use_meb = use_meb
+        self.use_dsu = use_dsu
         self.normBNa = nn.BatchNorm1d(D_text, affine=True)
         self.normBNb = nn.BatchNorm1d(D_text, affine=True)
         self.normBNc = nn.BatchNorm1d(D_text, affine=True)
@@ -930,12 +932,12 @@ class Model(nn.Module):
         # ---- RRA: Residual Reliability Alignment ----
         self.rra = None
         if self.use_rra and self.multi_modal:
-            # 【核心修复 2】：严格绑定刚刚恢复的高维变量，杜绝 D_text 可能存在的不一致
+            # 銆愭牳蹇冧慨澶?2銆戯細涓ユ牸缁戝畾鍒氬垰鎭㈠鐨勯珮缁村彉閲忥紝鏉滅粷 D_text 鍙兘瀛樺湪鐨勪笉涓€鑷?
             self.rra = ResidualReliabilityAlignment(
                 modal_dim={'t': in_dim_t, 'a': in_dim_a, 'v': in_dim_v},
                 unified_dim=512,
                 dropout=self.dropout,
-                use_align_loss=True  # 确保激活对齐损失
+                use_align_loss=True
             )
 
         # ---- MEB: Multi-center Emotion Ball ----
@@ -949,8 +951,16 @@ class Model(nn.Module):
                 z_dim=meb_input_dim,
                 n_classes=n_classes,
                 K_per_class=2,
-                tau_b=0.1,  # 注意：在 Cosine 空间，推荐的温度系数是 0.1
-                dropout=self.dropout
+                tau_b=0.30,
+                dropout=0.0,
+                shared_ratio=0.75,
+                lambda_overlap=0.3,
+                lambda_div=0.35,
+                lambda_ortho=0.02,
+                lambda_var=0.005,
+                lambda_radius=0.1,
+                radius_min=0.15,
+                radius_max=0.80
             )
 
     def _reverse_seq(self, X, mask):
@@ -964,59 +974,66 @@ class Model(nn.Module):
 
         return pad_sequence(xfs)
 
-    def forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None, labels=None):
+    def forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None, labels=None, return_aux=False):
 
-        # 默认 extra_loss 初始值（当 RRA/MEB 未启用时使用）
+        # 榛樿 extra_loss 鍒濆鍊硷紙褰?RRA/MEB 鏈惎鐢ㄦ椂浣跨敤锛?
         L_align = torch.tensor(0.0, device=U.device) if hasattr(U, 'device') else torch.tensor(0.0)
-        L_meb   = torch.tensor(0.0)
-        sample_rel = None
+        rra_loss_dict = {}  # 銆愬繀椤婚粯璁ゅ垵濮嬪寲銆戯細闃叉 RRA 鏈惎鐢ㄦ椂鏈熬 UnboundLocalError
+        L_meb   = torch.tensor(0.0, device=U.device) if hasattr(U, 'device') else torch.tensor(0.0)
+        meb_guidance = None
+        rra_balance_anchor = None
+        meb_balance_anchor = None
         # =============roberta features
         [r1, r2, r3, r4] = U
         seq_len, batch_size, feature_dim = r1.size()
+        base_device = r1.device
+        L_align = L_align.to(base_device)
+        L_meb = L_meb.to(base_device)
 
         if self.norm_strategy == 'LN':
-            # 优化：LayerNorm 天然对最后一个维度（feature_dim）进行归一化。
-            # r1 的形状已经是 [seq_len, batch_size, feature_dim]，完全不需要进行任何 transpose 和 reshape，直接传入即可。
+            # 浼樺寲锛歀ayerNorm 澶╃劧瀵规渶鍚庝竴涓淮搴︼紙feature_dim锛夎繘琛屽綊涓€鍖栥€?
+            # r1 鐨勫舰鐘跺凡缁忔槸 [seq_len, batch_size, feature_dim]锛屽畬鍏ㄤ笉闇€瑕佽繘琛屼换浣?transpose 鍜?reshape锛岀洿鎺ヤ紶鍏ュ嵆鍙€?
             r1 = self.normLNa(r1)
             r2 = self.normLNb(r2)
             r3 = self.normLNc(r3)
             r4 = self.normLNd(r4)
 
         elif self.norm_strategy == 'BN':
-            # 优化：BatchNorm1d 原生支持 3D 输入 [N, C, L]。
-            # 我们只需要用 permute 将 [seq_len, batch, feature_dim] 转换为 [batch, feature_dim, seq_len]。
-            # PyTorch 的 permute 是内存共享的视图（View）操作，不会像 reshape 那样强制开辟新显存。
+            # 浼樺寲锛欱atchNorm1d 鍘熺敓鏀寔 3D 杈撳叆 [N, C, L]銆?
+            # 鎴戜滑鍙渶瑕佺敤 permute 灏?[seq_len, batch, feature_dim] 杞崲涓?[batch, feature_dim, seq_len]銆?
+            # PyTorch 鐨?permute 鏄唴瀛樺叡浜殑瑙嗗浘锛圴iew锛夋搷浣滐紝涓嶄細鍍?reshape 閭ｆ牱寮哄埗寮€杈熸柊鏄惧瓨銆?
             r1 = self.normBNa(r1.permute(1, 2, 0)).permute(2, 0, 1)
             r2 = self.normBNb(r2.permute(1, 2, 0)).permute(2, 0, 1)
             r3 = self.normBNc(r3.permute(1, 2, 0)).permute(2, 0, 1)
             r4 = self.normBNd(r4.permute(1, 2, 0)).permute(2, 0, 1)
 
         elif self.norm_strategy == 'LN2':
-            # 优化：原代码每次 forward 都会实例化一个新的 nn.LayerNorm()，这是极大的性能浪费。
-            # 直接使用 F.layer_norm 可以达到完全相同的无参数归一化效果，并且避免了类的实例化开销。
+            # 浼樺寲锛氬師浠ｇ爜姣忔 forward 閮戒細瀹炰緥鍖栦竴涓柊鐨?nn.LayerNorm()锛岃繖鏄瀬澶х殑鎬ц兘娴垂銆?
+            # 鐩存帴浣跨敤 F.layer_norm 鍙互杈惧埌瀹屽叏鐩稿悓鐨勬棤鍙傛暟褰掍竴鍖栨晥鏋滐紝骞朵笖閬垮厤浜嗙被鐨勫疄渚嬪寲寮€閿€銆?
             normalized_shape = (seq_len, feature_dim)
             r1 = F.layer_norm(r1.transpose(0, 1), normalized_shape).transpose(0, 1)
             r2 = F.layer_norm(r2.transpose(0, 1), normalized_shape).transpose(0, 1)
             r3 = F.layer_norm(r3.transpose(0, 1), normalized_shape).transpose(0, 1)
             r4 = F.layer_norm(r4.transpose(0, 1), normalized_shape).transpose(0, 1)
 
-        r1 = self.dsu(r1)
-        r2 = self.dsu(r2)
-        r3 = self.dsu(r3)
-        r4 = self.dsu(r4)
+        if self.use_dsu:
+            r1 = self.dsu(r1)
+            r2 = self.dsu(r2)
+            r3 = self.dsu(r3)
+            r4 = self.dsu(r4)
 
-        # 增加安全检查，防止当没传入多模态特征时 DSU 报错
-        if U_a is not None:
-            U_a = self.dsu(U_a)
-        if U_v is not None:
-            U_v = self.dsu(U_v)
+            # 澧炲姞瀹夊叏妫€鏌ワ紝闃叉褰撴病浼犲叆澶氭ā鎬佺壒寰佹椂 DSU 鎶ラ敊
+            if U_a is not None:
+                U_a = self.dsu(U_a)
+            if U_v is not None:
+                U_v = self.dsu(U_v)
 
         U = (r1 + r2 + r3 + r4) / 4
         # =============roberta features
         # U = torch.cat((textf,acouf),dim=-1)
         # =============roberta features
 
-        # --------- 【RRA 植入点 A：残差可靠性对齐，仅作用于有效 utterance】 ---------
+        # --------- 銆怰RA 妞嶅叆鐐?A锛氭畫宸彲闈犳€у榻愶紝浠呬綔鐢ㄤ簬鏈夋晥 utterance銆?---------
         if self.use_rra and self.multi_modal and self.rra is not None:
             seq_len_rra, batch_size_rra, _ = U.shape
             # umask: [batch, seq_len], 1=valid, 0=padding
@@ -1024,21 +1041,43 @@ class Model(nn.Module):
             N_valid = valid_mask.sum().item()
 
             if N_valid == 0:
-                # 全是 padding，跳过 RRA
+                # 鍏ㄦ槸 padding锛岃烦杩?RRA
                 pass
             else:
-                # 布尔索引提取所有有效位置的特征 (N_valid, dim)
+                # 甯冨皵绱㈠紩鎻愬彇鎵€鏈夋湁鏁堜綅缃殑鐗瑰緛 (N_valid, dim)
                 flat_U   = U.transpose(0, 1)[valid_mask]
                 flat_Ua  = U_a.transpose(0, 1)[valid_mask]  if U_a is not None else None
                 flat_Uv  = U_v.transpose(0, 1)[valid_mask] if U_v is not None else None
 
-                # RRA: 只对有效位置做对齐和重标定,接受a
-                h_tilde_dict, L_align, alpha_rra = self.rra(
+                # 浠?qmask 鎻愬彇 speaker_id锛屽榻?flat_U
+                # qmask shape: [seq_len, batch, party] 鈥?party 閫氬父涓?2锛堝璇濆弻鏂癸級
+                qmask_transposed = qmask.permute(1, 2, 0)  # [batch, party, seq_len]
+                speaker_indices_per_utt = qmask_transposed.argmax(dim=1)  # [batch, seq_len]
+                speaker_ids_2d = speaker_indices_per_utt.float()  # [batch, seq_len]
+                # 鐩存帴浣跨敤 valid_mask 绱㈠紩锛屽洜涓轰袱鑰呴兘鏄?[batch, seq_len]
+                speaker_ids_flat = speaker_ids_2d[valid_mask]
+                speaker_ids_flat = speaker_ids_flat.long()
+
+                # RRA: 鍙鏈夋晥浣嶇疆鍋氬榻愬拰閲嶆爣瀹?
+                h_tilde_dict, rra_loss_dict, alpha_rra, sim_av_sub, r_dict, rra_balance_anchor = self.rra(
                     h_t=flat_U, h_a=flat_Ua, h_v=flat_Uv,
                     return_align_loss=True
                 )
-                sample_rel = alpha_rra.mean(dim=-1, keepdim=True)
-                # 预分配输出张量，padding 位置保持为 0
+                # Build a dedicated guidance signal for MEB instead of reusing
+                # the final RRA gates directly. This keeps RRA fusion control and
+                # MEB trust weighting semantically separated.
+                zero_ref = alpha_rra[:, :1]
+                conf_t = torch.sigmoid(r_dict.get('t', torch.zeros_like(zero_ref)))
+                conf_a = torch.sigmoid(r_dict.get('a', torch.zeros_like(zero_ref)))
+                conf_v = torch.sigmoid(r_dict.get('v', torch.zeros_like(zero_ref)))
+                agree_av = torch.clamp((sim_av_sub + 1.0) * 0.5, min=0.0, max=1.0)
+                meb_guidance = (
+                    0.45 * agree_av
+                    + 0.20 * conf_a
+                    + 0.20 * conf_v
+                    + 0.15 * conf_t
+                ).clamp(min=0.05, max=0.95)
+                # 棰勫垎閰嶈緭鍑哄紶閲忥紝padding 浣嶇疆淇濇寔涓?0
                 dim_t = h_tilde_dict['t'].size(-1)
                 dim_a = h_tilde_dict['a'].size(-1) if U_a is not None else 0
                 dim_v = h_tilde_dict['v'].size(-1) if U_v is not None else 0
@@ -1049,7 +1088,7 @@ class Model(nn.Module):
                 new_Uv = torch.zeros(batch_size_rra, seq_len_rra, dim_v, device=U_v.device,
                                      dtype=U_v.dtype) if U_v is not None else None
 
-                # 将 RRA 结果填回对应有效位置
+                # 灏?RRA 缁撴灉濉洖瀵瑰簲鏈夋晥浣嶇疆
                 new_U[valid_mask]  = h_tilde_dict['t']
                 if new_Ua is not None: new_Ua[valid_mask]  = h_tilde_dict['a']
                 if new_Uv is not None: new_Uv[valid_mask]  = h_tilde_dict['v']
@@ -1182,6 +1221,7 @@ class Model(nn.Module):
                 emotions_feat = nn.ReLU()(emotions_feat)
 
                 L_meb = torch.tensor(0.0, device=emotions_feat.device)
+                meb_balance_anchor = emotions_feat
 
                 if self.use_meb and self.meb is not None and labels is not None:
                     if not getattr(self.meb, '_is_initialized', False):
@@ -1189,12 +1229,14 @@ class Model(nn.Module):
                         self.meb._is_initialized = True
 
                     emotions_feat_enhanced, L_meb_dict = self.meb(
-                        emotions_feat, labels=labels,
-                        sample_rel=sample_rel.detach() if sample_rel is not None else None, # 新增传入置信度
-                        update_radii=self.training
+                        emotions_feat,
+                        labels=labels,
+                        guidance=meb_guidance.detach() if meb_guidance is not None else None,
+                        update_radii=self.training,
+                        epoch=epoch  # <--- 鏂板浼犲叆 current_epoch
                     )
                     L_meb = L_meb_dict['total']
-                    # 将增强后的特征继续送入分类器
+                    # 灏嗗寮哄悗鐨勭壒寰佺户缁€佸叆鍒嗙被鍣?
                     emotions_feat = emotions_feat_enhanced
                 # ---------------------------------------------------
 
@@ -1204,41 +1246,66 @@ class Model(nn.Module):
             emotions_feat = self.dropout_(emotions_feat)
             emotions_feat = nn.ReLU()(emotions_feat)
 
-            # --------- 【MEB 植入点 B：情绪球空间约束】 ---------
+            # --------- 銆怣EB 妞嶅叆鐐?B锛氭儏缁悆绌洪棿绾︽潫銆?---------
             L_meb = torch.tensor(0.0, device=emotions_feat.device)
+            meb_balance_anchor = emotions_feat
             if self.use_meb and self.meb is not None and labels is not None:
 
-                # 【关键修复 1】：补上 HyperGCN 分支缺失的 KMeans 球心初始化！
-                # 不做初始化会导致随机球心，破坏网络早期的特征学习
+                # 銆愬叧閿慨澶?1銆戯細琛ヤ笂 HyperGCN 鍒嗘敮缂哄け鐨?KMeans 鐞冨績鍒濆鍖栵紒
+                # 涓嶅仛鍒濆鍖栦細瀵艰嚧闅忔満鐞冨績锛岀牬鍧忕綉缁滄棭鏈熺殑鐗瑰緛瀛︿範
                 if not getattr(self.meb, '_is_initialized', False):
                     self.meb._init_ball_centers_kmeans(emotions_feat.detach(), labels)
                     self.meb._is_initialized = True
 
                 emotions_feat_enhanced, L_meb_dict = self.meb(
-                    emotions_feat, labels=labels,
-                    sample_rel=sample_rel.detach() if sample_rel is not None else None,  # <--- 新增这行
-                    update_radii=self.training
+                    emotions_feat,
+                    labels=labels,
+                    guidance=meb_guidance.detach() if meb_guidance is not None else None,
+                    update_radii=self.training,
+                    epoch=epoch  # <--- 鏂板浼犲叆 current_epoch
                 )
                 if isinstance(L_meb_dict, dict):
                     L_meb = L_meb_dict['total']
                 else:
                     L_meb = L_meb_dict
-                # 将增强后的特征继续送入分类器
+                # 灏嗗寮哄悗鐨勭壒寰佺户缁€佸叆鍒嗙被鍣?
                 emotions_feat = emotions_feat_enhanced
             # ---------------------------------------------------
 
             log_prob = F.log_softmax(self.smax_fc(emotions_feat), 1)
         else:
             print("There are no such kind of graph")
-        # --------- 【extra_loss 汇总：RRA + MEB】 ---------
+        # --------- 銆恊xtra_loss 姹囨€伙細RRA + MEB銆?---------
         current_epoch = epoch if epoch is not None else 0
 
-        # 【关键修复 2】：动态预热系数 (Warm-up)。前 20 轮线性从 0 涨到 1
-        warmup_factor = min(1.0, current_epoch / 15.0)
+        # 銆愬畬鏁翠慨澶嶃€戯細涓夋寮忚皟搴?(0-15杞?Warm-up, 15-40杞?Hold, 40杞悗 Cosine Decay)
+        if current_epoch <= 10:
+            meb_weight = 0.5 * (1 - math.cos(math.pi * current_epoch / 10.0))
+        elif current_epoch <= 20:
+            meb_weight = 1.0
+        else:
+            # 浣欏鸡骞虫粦琛板噺锛屼繚鐣?0.1 鍩虹寮哄害鎵撳簳
+            decay_ratio = min((current_epoch - 20) / 20.0, 1.0)  # 鍋囪鎬?Epoch=80锛岀敤 40 杞“鍑?
+            meb_weight = 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * decay_ratio))
 
-        # 【关键修复 3】：0.0 * L_align 彻底屏蔽强制特征对齐带来的空间破坏
-        # MEB 基础权重从 0.1 降为 0.05，并乘以 warmup_factor
-        extra_loss = 1.0 * L_align + (0.1 * warmup_factor) * L_meb
+        # 浠?rra_loss_dict 涓彁鍙栧悇鍒嗛噺锛坱otal 宸插寘鍚郴鏁帮級
+        if isinstance(rra_loss_dict, dict):
+            L_align = rra_loss_dict.get('total', torch.tensor(0.0, device=base_device))
+        else:
+            L_align = rra_loss_dict  # 鍏煎鏃ц繑鍥炲€?
+
+        # MEB 鎹熷け绯绘暟
+        lambda_meb = 0.05 * meb_weight
+        extra_loss = L_align + lambda_meb * L_meb
         # ---------------------------------------------------
+        if return_aux:
+            aux_loss_dict = {
+                'L_align_raw': L_align,
+                'L_meb_raw': L_meb,
+                'lambda_meb_sched': torch.tensor(lambda_meb, device=log_prob.device),
+                'rra_balance_anchor': rra_balance_anchor,
+                'meb_balance_anchor': meb_balance_anchor,
+            }
+            return log_prob, edge_index, edge_norm, edge_type, edge_index_lengths, extra_loss, aux_loss_dict
 
         return log_prob, edge_index, edge_norm, edge_type, edge_index_lengths, extra_loss

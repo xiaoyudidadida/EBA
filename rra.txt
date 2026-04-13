@@ -1,0 +1,113 @@
+(base) root@gjob-dev-697311833711173632-taskrole1-0:/gemini/code/eba_plus# bash run_IEMOCAP.sh --rra
+>>> 模式: 仅 RRA 消融
+
+========================================
+>>> 开始运行: SGF + RRA
+========================================
+Namespace(Dataset='IEMOCAP', Deep_GCN_nlayers=4, active_listener=False, alpha=0.2, attention='general', av_using_lstm=False, base_model='GRU', batch_size=16, class_weight=True, dropout=0.4, edge_ratio=0.01, epochs=80, graph_construct='direct', graph_model=True, graph_type='hyper', l2=3e-05, lr=0.0001, mm_fusion_mthd='concat_DHT', modals='avl', multi_modal=True, multiheads=6, no_cuda=False, nodal_attention=True, norm='BN', num_convs=3, opn='corr', proto_k=1, rec_dropout=0.1, seed=1746, tensorboard=False, use_gcn=False, use_meb=False, use_modal=False, use_residue=False, use_rra=True, use_speaker=True, use_topic=False, windowf=10, windowp=10)
+Running on GPU
+construct hyper
+Graph NN with GRU as base model.
+Emotion detection:
+epoch: 1, train_loss: 3.0767, train_acc: 26.08, train_fscore: 21.76, test_loss: 2.7344, test_acc: 39.56, test_fscore: 30.54, time: 10.23 sec
+epoch: 2, train_loss: 2.6616, train_acc: 45.49, train_fscore: 41.88, test_loss: 2.5597, test_acc: 41.1, test_fscore: 38.29, time: 10.21 sec
+epoch: 3, train_loss: 2.5261, train_acc: 46.35, train_fscore: 43.8, test_loss: 2.3589, test_acc: 41.22, test_fscore: 38.13, time: 10.33 sec
+epoch: 4, train_loss: 2.3436, train_acc: 50.24, train_fscore: 48.9, test_loss: 2.226, test_acc: 56.81, test_fscore: 54.98, time: 10.35 sec
+epoch: 5, train_loss: 2.2277, train_acc: 55.59, train_fscore: 54.33, test_loss: 2.1017, test_acc: 59.15, test_fscore: 59.88, time: 11.1 sec
+epoch: 6, train_loss: 2.143, train_acc: 59.28, train_fscore: 58.65, test_loss: 2.0298, test_acc: 62.05, test_fscore: 62.35, time: 10.96 sec
+epoch: 7, train_loss: 2.0833, train_acc: 61.72, train_fscore: 60.95, test_loss: 1.992, test_acc: 63.15, test_fscore: 63.36, time: 11.51 sec
+epoch: 8, train_loss: 2.0234, train_acc: 64.7, train_fscore: 64.21, test_loss: 1.962, test_acc: 63.15, test_fscore: 63.57, time: 11.28 sec
+epoch: 9, train_loss: 1.9819, train_acc: 65.58, train_fscore: 65.08, test_loss: 1.9362, test_acc: 63.83, test_fscore: 64.16, time: 11.36 sec
+epoch: 10, train_loss: 1.9388, train_acc: 67.5, train_fscore: 67.06, test_loss: 1.9199, test_acc: 63.22, test_fscore: 63.73, time: 11.32 sec
+epoch: 11, train_loss: 1.9031, train_acc: 68.92, train_fscore: 68.57, test_loss: 1.9132, test_acc: 63.59, test_fscore: 64.05, time: 11.33 sec
+epoch: 12, train_loss: 1.8691, train_acc: 70.12, train_fscore: 69.86, test_loss: 1.9151, test_acc: 63.22, test_fscore: 63.75, time: 11.32 sec
+epoch: 13, train_loss: 1.837, train_acc: 71.41, train_fscore: 71.15, test_loss: 1.9047, test_acc: 64.08, test_fscore: 64.56, time: 11.57 sec
+epoch: 14, train_loss: 1.805, train_acc: 72.72, train_fscore: 72.51, test_loss: 1.8888, test_acc: 64.94, test_fscore: 65.47, time: 11.26 sec
+epoch: 15, train_loss: 1.7827, train_acc: 73.41, train_fscore: 73.24, test_loss: 1.8345, test_acc: 65.74, test_fscore: 66.03, time: 11.03 sec
+epoch: 16, train_loss: 1.7734, train_acc: 73.61, train_fscore: 73.49, test_loss: 1.9442, test_acc: 62.35, test_fscore: 61.68, time: 11.12 sec
+epoch: 17, train_loss: 1.7757, train_acc: 72.7, train_fscore: 72.53, test_loss: 1.8606, test_acc: 65.87, test_fscore: 65.73, time: 10.96 sec
+epoch: 18, train_loss: 1.7168, train_acc: 76.7, train_fscore: 76.59, test_loss: 1.8088, test_acc: 64.57, test_fscore: 65.17, time: 10.8 sec
+epoch: 19, train_loss: 1.6623, train_acc: 75.94, train_fscore: 75.79, test_loss: 1.8013, test_acc: 66.48, test_fscore: 66.28, time: 11.02 sec
+epoch: 20, train_loss: 1.625, train_acc: 77.18, train_fscore: 77.03, test_loss: 1.8361, test_acc: 62.66, test_fscore: 62.84, time: 10.93 sec
+epoch: 21, train_loss: 1.5855, train_acc: 78.85, train_fscore: 78.72, test_loss: 1.7523, test_acc: 66.97, test_fscore: 67.34, time: 11.57 sec
+epoch: 22, train_loss: 1.5542, train_acc: 79.66, train_fscore: 79.57, test_loss: 1.7568, test_acc: 67.47, test_fscore: 67.4, time: 11.06 sec
+epoch: 23, train_loss: 1.5315, train_acc: 80.9, train_fscore: 80.82, test_loss: 1.741, test_acc: 68.21, test_fscore: 68.25, time: 11.23 sec
+epoch: 24, train_loss: 1.51, train_acc: 80.91, train_fscore: 80.81, test_loss: 1.7767, test_acc: 66.73, test_fscore: 66.93, time: 11.18 sec
+epoch: 25, train_loss: 1.4867, train_acc: 82.2, train_fscore: 82.11, test_loss: 1.787, test_acc: 65.37, test_fscore: 65.72, time: 10.86 sec
+epoch: 26, train_loss: 1.4609, train_acc: 83.41, train_fscore: 83.32, test_loss: 1.7419, test_acc: 69.01, test_fscore: 69.35, time: 11.23 sec
+epoch: 27, train_loss: 1.4434, train_acc: 84.03, train_fscore: 83.97, test_loss: 1.8014, test_acc: 68.52, test_fscore: 67.92, time: 10.4 sec
+epoch: 28, train_loss: 1.4325, train_acc: 84.13, train_fscore: 84.11, test_loss: 1.7433, test_acc: 68.27, test_fscore: 68.36, time: 10.45 sec
+epoch: 29, train_loss: 1.4193, train_acc: 85.16, train_fscore: 85.11, test_loss: 1.7482, test_acc: 66.97, test_fscore: 67.33, time: 11.06 sec
+epoch: 30, train_loss: 1.4141, train_acc: 85.13, train_fscore: 85.06, test_loss: 1.7668, test_acc: 66.91, test_fscore: 67.05, time: 13.94 sec
+epoch: 31, train_loss: 1.3951, train_acc: 85.3, train_fscore: 85.2, test_loss: 1.8783, test_acc: 60.81, test_fscore: 59.39, time: 12.5 sec
+epoch: 32, train_loss: 1.3808, train_acc: 85.58, train_fscore: 85.52, test_loss: 1.7455, test_acc: 67.22, test_fscore: 66.87, time: 11.73 sec
+epoch: 33, train_loss: 1.368, train_acc: 86.8, train_fscore: 86.67, test_loss: 1.7298, test_acc: 67.96, test_fscore: 68.18, time: 12.06 sec
+epoch: 34, train_loss: 1.3506, train_acc: 87.97, train_fscore: 87.9, test_loss: 1.9788, test_acc: 67.1, test_fscore: 67.07, time: 11.45 sec
+epoch: 35, train_loss: 1.3627, train_acc: 86.78, train_fscore: 86.74, test_loss: 1.7534, test_acc: 69.5, test_fscore: 69.77, time: 11.35 sec
+epoch: 36, train_loss: 1.3285, train_acc: 88.78, train_fscore: 88.75, test_loss: 1.8186, test_acc: 65.37, test_fscore: 65.64, time: 11.29 sec
+epoch: 37, train_loss: 1.298, train_acc: 90.22, train_fscore: 90.19, test_loss: 1.8189, test_acc: 67.96, test_fscore: 67.98, time: 11.23 sec
+epoch: 38, train_loss: 1.2851, train_acc: 90.53, train_fscore: 90.49, test_loss: 1.8346, test_acc: 69.56, test_fscore: 69.25, time: 11.37 sec
+epoch: 39, train_loss: 1.2685, train_acc: 91.76, train_fscore: 91.73, test_loss: 1.8107, test_acc: 69.87, test_fscore: 69.99, time: 11.56 sec
+epoch: 40, train_loss: 1.2679, train_acc: 91.45, train_fscore: 91.4, test_loss: 1.8297, test_acc: 68.21, test_fscore: 68.68, time: 11.28 sec
+epoch: 41, train_loss: 1.2908, train_acc: 89.69, train_fscore: 89.67, test_loss: 2.0319, test_acc: 65.13, test_fscore: 65.06, time: 11.45 sec
+epoch: 42, train_loss: 1.2659, train_acc: 90.57, train_fscore: 90.55, test_loss: 1.7839, test_acc: 69.81, test_fscore: 69.85, time: 11.21 sec
+epoch: 43, train_loss: 1.2429, train_acc: 92.17, train_fscore: 92.13, test_loss: 1.7824, test_acc: 67.22, test_fscore: 67.41, time: 11.13 sec
+epoch: 44, train_loss: 1.2367, train_acc: 91.79, train_fscore: 91.79, test_loss: 1.9002, test_acc: 68.95, test_fscore: 68.85, time: 11.04 sec
+epoch: 45, train_loss: 1.2223, train_acc: 92.41, train_fscore: 92.37, test_loss: 1.8526, test_acc: 67.96, test_fscore: 68.35, time: 11.19 sec
+epoch: 46, train_loss: 1.1965, train_acc: 94.7, train_fscore: 94.68, test_loss: 1.8102, test_acc: 69.75, test_fscore: 69.75, time: 11.13 sec
+epoch: 47, train_loss: 1.1911, train_acc: 94.08, train_fscore: 94.07, test_loss: 1.9387, test_acc: 69.38, test_fscore: 69.39, time: 11.19 sec
+epoch: 48, train_loss: 1.1741, train_acc: 94.56, train_fscore: 94.55, test_loss: 2.0819, test_acc: 68.39, test_fscore: 68.52, time: 11.54 sec
+epoch: 49, train_loss: 1.1588, train_acc: 95.49, train_fscore: 95.48, test_loss: 1.9413, test_acc: 70.43, test_fscore: 70.6, time: 11.41 sec
+epoch: 50, train_loss: 1.1463, train_acc: 95.94, train_fscore: 95.93, test_loss: 1.8605, test_acc: 70.92, test_fscore: 70.72, time: 11.34 sec
+epoch: 51, train_loss: 1.1378, train_acc: 96.16, train_fscore: 96.15, test_loss: 1.9567, test_acc: 67.22, test_fscore: 67.29, time: 11.39 sec
+epoch: 52, train_loss: 1.1317, train_acc: 95.82, train_fscore: 95.8, test_loss: 1.9344, test_acc: 62.66, test_fscore: 62.04, time: 11.23 sec
+epoch: 53, train_loss: 1.1386, train_acc: 95.39, train_fscore: 95.37, test_loss: 1.8461, test_acc: 62.85, test_fscore: 62.11, time: 11.12 sec
+epoch: 54, train_loss: 1.1561, train_acc: 93.82, train_fscore: 93.79, test_loss: 2.026, test_acc: 68.95, test_fscore: 68.51, time: 11.53 sec
+epoch: 55, train_loss: 1.1565, train_acc: 94.11, train_fscore: 94.11, test_loss: 1.929, test_acc: 70.24, test_fscore: 70.29, time: 11.7 sec
+epoch: 56, train_loss: 1.1454, train_acc: 95.11, train_fscore: 95.1, test_loss: 1.9106, test_acc: 64.88, test_fscore: 65.21, time: 11.19 sec
+epoch: 57, train_loss: 1.1246, train_acc: 95.61, train_fscore: 95.63, test_loss: 2.108, test_acc: 68.52, test_fscore: 68.31, time: 11.19 sec
+epoch: 58, train_loss: 1.0907, train_acc: 97.37, train_fscore: 97.36, test_loss: 1.8274, test_acc: 70.92, test_fscore: 71.14, time: 11.26 sec
+epoch: 59, train_loss: 1.0646, train_acc: 97.87, train_fscore: 97.86, test_loss: 1.8734, test_acc: 69.93, test_fscore: 70.16, time: 11.3 sec
+epoch: 60, train_loss: 1.051, train_acc: 98.04, train_fscore: 98.03, test_loss: 1.9659, test_acc: 70.06, test_fscore: 70.13, time: 11.53 sec
+epoch: 61, train_loss: 1.0339, train_acc: 98.57, train_fscore: 98.57, test_loss: 1.8637, test_acc: 69.99, test_fscore: 70.14, time: 11.37 sec
+epoch: 62, train_loss: 1.0213, train_acc: 98.69, train_fscore: 98.69, test_loss: 2.0065, test_acc: 69.38, test_fscore: 69.52, time: 11.68 sec
+epoch: 63, train_loss: 1.0083, train_acc: 98.78, train_fscore: 98.78, test_loss: 2.0205, test_acc: 70.36, test_fscore: 70.42, time: 11.5 sec
+epoch: 64, train_loss: 0.997, train_acc: 99.02, train_fscore: 99.02, test_loss: 1.8863, test_acc: 70.49, test_fscore: 70.79, time: 11.22 sec
+epoch: 65, train_loss: 0.9852, train_acc: 99.17, train_fscore: 99.17, test_loss: 2.0004, test_acc: 71.35, test_fscore: 71.36, time: 11.33 sec
+epoch: 66, train_loss: 0.9759, train_acc: 99.02, train_fscore: 99.02, test_loss: 1.9995, test_acc: 70.18, test_fscore: 70.16, time: 11.14 sec
+epoch: 67, train_loss: 0.9648, train_acc: 99.23, train_fscore: 99.22, test_loss: 2.0916, test_acc: 68.33, test_fscore: 68.54, time: 11.39 sec
+epoch: 68, train_loss: 0.9583, train_acc: 99.07, train_fscore: 99.07, test_loss: 2.5588, test_acc: 58.84, test_fscore: 58.51, time: 11.24 sec
+epoch: 69, train_loss: 0.9587, train_acc: 98.61, train_fscore: 98.6, test_loss: 2.1441, test_acc: 68.02, test_fscore: 67.97, time: 11.76 sec
+epoch: 70, train_loss: 0.9505, train_acc: 98.83, train_fscore: 98.83, test_loss: 2.2294, test_acc: 68.39, test_fscore: 67.65, time: 11.13 sec
+epoch: 71, train_loss: 0.9621, train_acc: 97.93, train_fscore: 97.94, test_loss: 2.0624, test_acc: 65.87, test_fscore: 65.47, time: 11.26 sec
+epoch: 72, train_loss: 0.9815, train_acc: 96.85, train_fscore: 96.84, test_loss: 1.9238, test_acc: 65.13, test_fscore: 65.47, time: 11.43 sec
+epoch: 73, train_loss: 0.9876, train_acc: 96.52, train_fscore: 96.52, test_loss: 2.432, test_acc: 61.8, test_fscore: 61.68, time: 11.39 sec
+epoch: 74, train_loss: 0.9833, train_acc: 96.04, train_fscore: 96.04, test_loss: 1.7427, test_acc: 68.64, test_fscore: 68.39, time: 11.4 sec
+epoch: 75, train_loss: 0.9453, train_acc: 98.24, train_fscore: 98.24, test_loss: 2.094, test_acc: 67.16, test_fscore: 67.24, time: 11.39 sec
+epoch: 76, train_loss: 0.9397, train_acc: 97.57, train_fscore: 97.58, test_loss: 1.9748, test_acc: 67.96, test_fscore: 68.01, time: 11.24 sec
+epoch: 77, train_loss: 0.9153, train_acc: 99.26, train_fscore: 99.26, test_loss: 1.9963, test_acc: 69.69, test_fscore: 69.82, time: 10.99 sec
+epoch: 78, train_loss: 0.8978, train_acc: 99.21, train_fscore: 99.21, test_loss: 2.0009, test_acc: 69.32, test_fscore: 69.28, time: 10.74 sec
+epoch: 79, train_loss: 0.8851, train_acc: 99.66, train_fscore: 99.66, test_loss: 1.9823, test_acc: 67.28, test_fscore: 67.78, time: 11.8 sec
+epoch: 80, train_loss: 0.8753, train_acc: 99.59, train_fscore: 99.59, test_loss: 1.953, test_acc: 68.64, test_fscore: 68.23, time: 11.34 sec
+Test performance..
+F-Score: 71.36
+              precision    recall  f1-score   support
+
+           0     0.6333    0.5278    0.5758       144
+           1     0.8455    0.7592    0.8000       245
+           2     0.7547    0.6250    0.6838       384
+           3     0.6193    0.7176    0.6649       170
+           4     0.8105    0.8294    0.8198       299
+           5     0.6190    0.7507    0.6785       381
+
+    accuracy                         0.7135      1623
+   macro avg     0.7137    0.7016    0.7038      1623
+weighted avg     0.7219    0.7135    0.7136      1623
+
+[[ 76   5  13   0  48   2]
+ [  2 186   9   5   0  43]
+ [ 15  21 240  19   7  82]
+ [  0   1   4 122   0  43]
+ [ 27   2  16   0 248   6]
+ [  0   5  36  51   3 286]]
+(base) root@gjob-dev-69731183

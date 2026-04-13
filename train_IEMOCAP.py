@@ -1,4 +1,4 @@
-import os
+﻿import os
 import math
 import numpy as np, argparse, time, pickle, random
 import torch
@@ -22,6 +22,145 @@ import warnings
 
 warnings.filterwarnings('ignore')
 import dill
+
+
+def _iter_optimizer_params(optimizer):
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p is not None and p.requires_grad:
+                yield p
+
+
+def _flatten_grads(grads):
+    valid = [g.reshape(-1) for g in grads if g is not None]
+    if len(valid) == 0:
+        return None
+    return torch.cat(valid, dim=0)
+
+
+def _tensor_grad_rms(loss, anchor):
+    if loss is None or not torch.is_tensor(loss) or (not loss.requires_grad):
+        device = loss.device if torch.is_tensor(loss) else torch.device('cpu')
+        return torch.tensor(0.0, device=device)
+    if anchor is None or (not torch.is_tensor(anchor)) or (not anchor.requires_grad):
+        return torch.tensor(0.0, device=loss.device)
+    grad = torch.autograd.grad(
+        loss, anchor, retain_graph=True, create_graph=False, allow_unused=True
+    )[0]
+    if grad is None:
+        return torch.tensor(0.0, device=loss.device)
+    gvec = grad.reshape(-1)
+    if gvec.numel() == 0:
+        return torch.tensor(0.0, device=loss.device)
+    return gvec.norm(p=2) / math.sqrt(float(gvec.numel()))
+
+
+class AuxGradBalancer:
+    """
+    Dynamic balancing for auxiliary losses on activation anchors.
+    The balancing target is the RMS gradient magnitude on each loss-specific
+    hidden representation instead of module-private parameter tensors.
+    """
+
+    def __init__(self, ema=0.95, eps=1e-8, min_w=0.7, max_w=1.3, beta=0.5, warmup_epochs=5):
+        self.ema = ema
+        self.eps = eps
+        self.min_w = min_w
+        self.max_w = max_w
+        self.beta = beta
+        self.warmup_epochs = warmup_epochs
+        self.w_align = 1.0
+        self.w_meb = 1.0
+        self.w_sgf = 1.0
+
+    def _update(self, current, target):
+        value = self.ema * current + (1.0 - self.ema) * target
+        return float(np.clip(value, self.min_w, self.max_w))
+
+    def _targets_from_norms(self, grad_norms):
+        valid = [g for g in grad_norms if g > 0.0]
+        if len(valid) == 0:
+            return [1.0 for _ in grad_norms]
+
+        g_ref = float(np.mean(valid))
+        targets = []
+        for g in grad_norms:
+            if g <= 0.0:
+                targets.append(1.0)
+            else:
+                targets.append((g_ref / (g + self.eps)) ** self.beta)
+
+        mean_target = float(np.mean(targets))
+        if mean_target <= 0.0:
+            return [1.0 for _ in grad_norms]
+        return [float(np.clip(t / mean_target, self.min_w, self.max_w)) for t in targets]
+
+    def compute(self, align_loss, meb_loss, align_anchor, meb_anchor, epoch=None):
+        gna = _tensor_grad_rms(align_loss, align_anchor)
+        gnm = _tensor_grad_rms(meb_loss, meb_anchor)
+        ga = float(gna.detach().item())
+        gm = float(gnm.detach().item())
+
+        if epoch is not None and epoch < self.warmup_epochs:
+            self.w_align = 1.0
+            self.w_meb = 1.0
+            return self.w_align, self.w_meb, ga, gm
+
+        target_a, target_m = self._targets_from_norms([ga, gm])
+        self.w_align = self._update(self.w_align, target_a)
+        self.w_meb = self._update(self.w_meb, target_m)
+        return self.w_align, self.w_meb, ga, gm
+
+    def compute_three(self, align_loss, meb_loss, sgf_loss, align_anchor, meb_anchor, sgf_anchor, epoch=None):
+        gna = _tensor_grad_rms(align_loss, align_anchor)
+        gnm = _tensor_grad_rms(meb_loss, meb_anchor)
+        gns = _tensor_grad_rms(sgf_loss, sgf_anchor)
+        ga = float(gna.detach().item())
+        gm = float(gnm.detach().item())
+        gs = float(gns.detach().item())
+
+        if epoch is not None and epoch < self.warmup_epochs:
+            self.w_align = 1.0
+            self.w_meb = 1.0
+            self.w_sgf = 1.0
+            return self.w_align, self.w_meb, self.w_sgf, ga, gm, gs
+
+        target_a, target_m, target_s = self._targets_from_norms([ga, gm, gs])
+        self.w_align = self._update(self.w_align, target_a)
+        self.w_meb = self._update(self.w_meb, target_m)
+        self.w_sgf = self._update(self.w_sgf, target_s)
+        return self.w_align, self.w_meb, self.w_sgf, ga, gm, gs
+
+
+def _build_sgf_balance_anchor(pt_list, wt_list):
+    parts = []
+    for tensor in wt_list:
+        if tensor is not None:
+            parts.append(tensor[:, -1:].reshape(tensor.size(0), -1))
+    for tensor in pt_list:
+        if tensor is None:
+            continue
+        parts.append(tensor[:, -1:].reshape(tensor.size(0), -1))
+        if tensor.size(1) > 1:
+            parts.append(tensor[:, :-1, :].mean(dim=1))
+    if len(parts) == 0:
+        return None
+    return torch.cat(parts, dim=-1)
+
+
+def apply_shallow_grad_tuning(model, min_norm=1e-4, boost=1.1, max_scale=5.0):
+    shallow_keys = ('rra.projection', 'rra.branch', 'rra.scorer')
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        if not any(k in name for k in shallow_keys):
+            continue
+        gn = p.grad.norm(p=2)
+        if torch.isfinite(gn) and gn.item() < min_norm:
+            scale = min(max_scale, float(min_norm / (gn.item() + 1e-12)))
+            p.grad.mul_(scale)
+        p.grad.mul_(boost)
+
 
 seed = 1746  # We use seed = 1746 on IEMOCAP and seed = 67137 on MELD
 meld_speakers = ['Rachel', 'Joey', 'Ross', 'Monica', 'Chandler', 'Phoebe']
@@ -120,7 +259,7 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, optimizer=None,
 
 	seed_everything()
 
-	# 修复：使用 torch.set_grad_enabled 动态控制计算图
+	# 淇锛氫娇鐢?torch.set_grad_enabled 鍔ㄦ€佹帶鍒惰绠楀浘
 	with torch.set_grad_enabled(train):
 		for data in dataloader:
 			if train:
@@ -139,15 +278,15 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, optimizer=None,
 			labels.append(labels_.data.cpu().numpy())
 			masks.append(umask.view(-1).cpu().numpy())
 
-			# 获取 item() 避免图累积
+			# 鑾峰彇 item() 閬垮厤鍥剧疮绉?
 			losses.append(loss.item() * masks[-1].sum())
 
 			if train:
 				loss.backward()
 				optimizer.step()
 			else:
-				# 评估时由于已在 no_grad 下，直接 append 也是安全的
-				alphas += [a.cpu() for a in alpha]  # 修复：将注意力权重移至 CPU，防止 VRAM 堆积
+				# 璇勪及鏃剁敱浜庡凡鍦?no_grad 涓嬶紝鐩存帴 append 涔熸槸瀹夊叏鐨?
+				alphas += [a.cpu() for a in alpha]  # 淇锛氬皢娉ㄦ剰鍔涙潈閲嶇Щ鑷?CPU锛岄槻姝?VRAM 鍫嗙Н
 				alphas_f += [a.cpu() for a in alpha_f]
 				alphas_b += [a.cpu() for a in alpha_b]
 				vids += data[-1]
@@ -183,19 +322,19 @@ class Stance_loss(nn.Module):
             features = features.view(features.shape[0], features.shape[1], -1)
 
         batch_size = features.shape[0]
-        # 提取当前特征所在的计算设备，确保后续所有张量操作与该设备对齐
+        # 鎻愬彇褰撳墠鐗瑰緛鎵€鍦ㄧ殑璁＄畻璁惧锛岀‘淇濆悗缁墍鏈夊紶閲忔搷浣滀笌璇ヨ澶囧榻?
         device = features.device
 
         if labels is not None and mask is not None:
             raise ValueError('Cannot define both `labels` and `mask`')
         elif labels is None and mask is None:
-            # 直接在目标设备上初始化单位矩阵，避免 CPU 到 GPU 的内存拷贝
+            # 鐩存帴鍦ㄧ洰鏍囪澶囦笂鍒濆鍖栧崟浣嶇煩闃碉紝閬垮厤 CPU 鍒?GPU 鐨勫唴瀛樻嫹璐?
             mask = torch.eye(batch_size, dtype=torch.float32, device=device)
         elif labels is not None:
             labels = labels.contiguous().view(-1, 1)
             if labels.shape[0] != batch_size:
                 raise ValueError('Num of labels does not match num of features')
-            # 使用 .to(device) 替代 .cuda() 保证设备无关性
+            # 浣跨敤 .to(device) 鏇夸唬 .cuda() 淇濊瘉璁惧鏃犲叧鎬?
             mask = torch.eq(labels, labels.T).float().add(0.0000001).to(device)
         else:
             mask = mask.float().to(device)
@@ -213,7 +352,7 @@ class Stance_loss(nn.Module):
 
         mask = mask.repeat(anchor_count, contrast_count)
 
-        # 直接在目标设备上生成序列，避免 .cuda() 产生的额外内存分配
+        # 鐩存帴鍦ㄧ洰鏍囪澶囦笂鐢熸垚搴忓垪锛岄伩鍏?.cuda() 浜х敓鐨勯澶栧唴瀛樺垎閰?
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
@@ -235,24 +374,24 @@ class Stance_loss(nn.Module):
 
 class Batched_Stance_loss(nn.Module):
     """
-    专为消除 for 循环设计的批量并行对比损失。
-    严格保证节点与节点之间的相似度计算绝对隔离，实现 100% 数学等价。
+    涓撲负娑堥櫎 for 寰幆璁捐鐨勬壒閲忓苟琛屽姣旀崯澶便€?
+    涓ユ牸淇濊瘉鑺傜偣涓庤妭鐐逛箣闂寸殑鐩镐技搴﹁绠楃粷瀵归殧绂伙紝瀹炵幇 100% 鏁板绛変环銆?
     """
     def __init__(self, temperature=0.07):
         super(Batched_Stance_loss, self).__init__()
         self.temperature = temperature
 
     def forward(self, features, labels):
-        # features 形状预期: [N, K, Dim]，例如 [有效节点数, 12, 256]
-        # labels 形状预期: [K]，例如 [12]
+        # features 褰㈢姸棰勬湡: [N, K, Dim]锛屼緥濡?[鏈夋晥鑺傜偣鏁? 12, 256]
+        # labels 褰㈢姸棰勬湡: [K]锛屼緥濡?[12]
         N, K, dim = features.shape
         device = features.device
 
-        # 1. 构造局部的标签掩码 [K, K]
+        # 1. 鏋勯€犲眬閮ㄧ殑鏍囩鎺╃爜 [K, K]
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
 
-        # 2. 消除对角线自身对比
+        # 2. 娑堥櫎瀵硅绾胯嚜韬姣?
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
@@ -262,22 +401,22 @@ class Batched_Stance_loss(nn.Module):
         mask_pos = mask * logits_mask
         mask_neg = (torch.ones_like(mask) - mask) * logits_mask
 
-        # 3. 将掩码扩展到整个 Batch [N, K, K]
+        # 3. 灏嗘帺鐮佹墿灞曞埌鏁翠釜 Batch [N, K, K]
         mask_pos = mask_pos.unsqueeze(0).expand(N, K, K)
         mask_neg = mask_neg.unsqueeze(0).expand(N, K, K)
 
-        # 4. 核心：bmm 并行计算相似度，严格隔离 N 个节点
+        # 4. 鏍稿績锛歜mm 骞惰璁＄畻鐩镐技搴︼紝涓ユ牸闅旂 N 涓妭鐐?
         # [N, K, Dim] x [N, Dim, K] -> [N, K, K]
         similarity = torch.exp(torch.bmm(features, features.transpose(1, 2)) / self.temperature)
 
-        # 5. 计算正负样本
+        # 5. 璁＄畻姝ｈ礋鏍锋湰
         pos = torch.sum(similarity * mask_pos, dim=2)  # [N, K]
         neg = torch.sum(similarity * mask_neg, dim=2)  # [N, K]
 
-        # 6. 计算损失，加 1e-8 防止 log(0)
+        # 6. 璁＄畻鎹熷け锛屽姞 1e-8 闃叉 log(0)
         loss_matrix = -torch.log(pos / (pos + neg + 1e-8) + 1e-8)  # [N, K]
 
-        # 7. 还原原代码的计算尺度：单节点的均值，再对所有节点求和
+        # 7. 杩樺師鍘熶唬鐮佺殑璁＄畻灏哄害锛氬崟鑺傜偣鐨勫潎鍊硷紝鍐嶅鎵€鏈夎妭鐐规眰鍜?
         loss = torch.sum(torch.mean(loss_matrix, dim=1))
 
         return loss
@@ -290,12 +429,13 @@ def Entropy(x):
 
 target_criterion = Stance_loss(0.07)
 batched_target_criterion = Batched_Stance_loss(0.07)
+aux_grad_balancer = AuxGradBalancer()
 
 proto_k=2
 
 def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, modals, optimizer=None, train=False,
 							  dataset='IEMOCAP'):
-	global target_criterion, ss_t
+	global target_criterion, ss_t, aux_grad_balancer
 	losses, preds, labels = [], [], []
 	tp1, tl1, tp2, tl2 = [], [], [], []
 	scores, vids = [], []
@@ -310,7 +450,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 	assert not train or optimizer != None
 	if train:
 		model.train()
-		model.dsu.training = True
+		model.dsu.training = bool(args.use_dsu)
 		gt1.train()
 		gt2.train()
 		gt3.train()
@@ -349,11 +489,11 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 
 			lengths = umask.sum(dim=1).long().tolist()
 
-			# 1. 明确获取 batch_size 和 seq_len
+			# 1. 鏄庣‘鑾峰彇 batch_size 鍜?seq_len
 			batch_size = umask.size(0)
 			seq_len = umask.size(1)
 
-			# 2. 将原始输入 [seq_len, batch_size, dim] 转置为 [batch_size, seq_len, dim] 以匹配 umask
+			# 2. 灏嗗師濮嬭緭鍏?[seq_len, batch_size, dim] 杞疆涓?[batch_size, seq_len, dim] 浠ュ尮閰?umask
 			ttextf1_b = ttextf1.transpose(0, 1)
 			ttextf2_b = ttextf2.transpose(0, 1)
 			ttextf3_b = ttextf3.transpose(0, 1)
@@ -361,15 +501,15 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			tacouf_b = tacouf.transpose(0, 1)
 			tvisuf_b = tvisuf.transpose(0, 1)
 
-			# 3. 生成有效掩码 [batch_size, seq_len]
+			# 3. 鐢熸垚鏈夋晥鎺╃爜 [batch_size, seq_len]
 			valid_mask = (umask != 0)
 
-			# 4. 提取有效的 speaker 标签
+			# 4. 鎻愬彇鏈夋晥鐨?speaker 鏍囩
 			s_t = speakers[valid_mask].clone()
 			s_t[s_t == -1] = len(data_speakers)
 			s_t = s_t.float().cuda() if cuda else s_t.float()
 
-			# 5. 利用布尔索引提取有效特征，完全消除 Python for 循环和 torch.cat 的显存碎片
+			# 5. 鍒╃敤甯冨皵绱㈠紩鎻愬彇鏈夋晥鐗瑰緛锛屽畬鍏ㄦ秷闄?Python for 寰幆鍜?torch.cat 鐨勬樉瀛樼鐗?
 			flat_ttextf1 = ttextf1_b[valid_mask]
 			flat_ttextf2 = ttextf2_b[valid_mask]
 			flat_ttextf3 = ttextf3_b[valid_mask]
@@ -377,7 +517,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			flat_tacouf = tacouf_b[valid_mask]
 			flat_tvisuf = tvisuf_b[valid_mask]
 
-			# 6. 送入 GraphNN 计算 (全程在 GPU 上高并行运行)
+			# 6. 閫佸叆 GraphNN 璁＄畻 (鍏ㄧ▼鍦?GPU 涓婇珮骞惰杩愯)
 			pt1, wt1 = gt1(flat_ttextf1, torch.cat(textproto[0], dim=0).cuda())
 			pt2, wt2 = gt2(flat_ttextf2, torch.cat(textproto[1], dim=0).cuda())
 			pt3, wt3 = gt3(flat_ttextf3, torch.cat(textproto[2], dim=0).cuda())
@@ -385,7 +525,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			pa, wa = ga(flat_tacouf, torch.cat(audioproto, dim=0).cuda())
 			pv, wv = gv(flat_tvisuf, torch.cat(visproto, dim=0).cuda())
 
-			# 7. 预分配组合后的特征张量内存 [batch_size, seq_len, new_dim]
+			# 7. 棰勫垎閰嶇粍鍚堝悗鐨勭壒寰佸紶閲忓唴瀛?[batch_size, seq_len, new_dim]
 			textf1 = torch.zeros(batch_size, seq_len, ttextf1_b.size(-1) + pt1.size(-1), device=ttextf1_b.device)
 			textf2 = torch.zeros(batch_size, seq_len, ttextf2_b.size(-1) + pt2.size(-1), device=ttextf2_b.device)
 			textf3 = torch.zeros(batch_size, seq_len, ttextf3_b.size(-1) + pt3.size(-1), device=ttextf3_b.device)
@@ -393,7 +533,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			acouf = torch.zeros(batch_size, seq_len, tacouf_b.size(-1) + pa.size(-1), device=tacouf_b.device)
 			visuf = torch.zeros(batch_size, seq_len, tvisuf_b.size(-1) + pv.size(-1), device=tvisuf_b.device)
 
-			# 8. 利用 GPU 并行掩码直接拼接赋值
+			# 8. 鍒╃敤 GPU 骞惰鎺╃爜鐩存帴鎷兼帴璧嬪€?
 			textf1[valid_mask] = torch.cat([flat_ttextf1, pt1[:, -1]], dim=-1)
 			textf2[valid_mask] = torch.cat([flat_ttextf2, pt2[:, -1]], dim=-1)
 			textf3[valid_mask] = torch.cat([flat_ttextf3, pt3[:, -1]], dim=-1)
@@ -401,7 +541,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			acouf[valid_mask] = torch.cat([flat_tacouf, pa[:, -1]], dim=-1)
 			visuf[valid_mask] = torch.cat([flat_tvisuf, pv[:, -1]], dim=-1)
 
-			# 9. 转置回 [seq_len, batch_size, dim] 以满足下游 Base Model 的需求
+			# 9. 杞疆鍥?[seq_len, batch_size, dim] 浠ユ弧瓒充笅娓?Base Model 鐨勯渶姹?
 			textf1 = textf1.transpose(0, 1)
 			textf2 = textf2.transpose(0, 1)
 			textf3 = textf3.transpose(0, 1)
@@ -435,42 +575,53 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 					raise NotImplementedError
 
 			flat_label = label[valid_mask]
+			model_labels = flat_label if train else None
 
+			need_aux = bool(train and args.use_aux_grad_balance)
 			if args.multi_modal and args.mm_fusion_mthd == 'gated':
-				log_prob, e_i, e_n, e_t, e_l, extra_loss = model(textf, qmask, umask, lengths, acouf, visuf,
-																 epoch=epoch, labels=flat_label)
+				model_out = model(textf, qmask, umask, lengths, acouf, visuf,
+								  epoch=epoch, labels=model_labels, return_aux=need_aux)
 			elif args.multi_modal and args.mm_fusion_mthd == 'concat_subsequently':
-				log_prob, e_i, e_n, e_t, e_l, extra_loss = model([textf1, textf2, textf3, textf4], qmask, umask,
-																 lengths,
-																 acouf, visuf, epoch=epoch, labels=flat_label)
+				model_out = model([textf1, textf2, textf3, textf4], qmask, umask,
+								  lengths, acouf, visuf, epoch=epoch, labels=model_labels,
+								  return_aux=need_aux)
 			elif args.multi_modal and args.mm_fusion_mthd == 'concat_DHT':
-				log_prob, e_i, e_n, e_t, e_l, extra_loss = model([textf1, textf2, textf3, textf4], qmask, umask,
-																 lengths,
-																 acouf, visuf, epoch=epoch, labels=flat_label)
+				model_out = model([textf1, textf2, textf3, textf4], qmask, umask,
+								  lengths, acouf, visuf, epoch=epoch, labels=model_labels,
+								  return_aux=need_aux)
 			else:
-				log_prob, e_i, e_n, e_t, e_l, extra_loss = model(textf, qmask, umask, lengths, epoch=epoch,
-																 labels=flat_label)
+				model_out = model(textf, qmask, umask, lengths, epoch=epoch,
+								  labels=model_labels, return_aux=need_aux)
 
-			# 把 flat_label 覆盖给 label，供后面的 loss_function 和指标统计使用
+			aux_loss_dict = None
+			if len(model_out) == 7:
+				log_prob, e_i, e_n, e_t, e_l, extra_loss, aux_loss_dict = model_out
+			else:
+				log_prob, e_i, e_n, e_t, e_l, extra_loss = model_out
+
+			# 鎶?flat_label 瑕嗙洊缁?label锛屼緵鍚庨潰鐨?loss_function 鍜屾寚鏍囩粺璁′娇鐢?
 			label = flat_label
 
-		# 计算基础 Loss（含 RRA/MEB extra_loss）
-			loss = loss_function(log_prob, label) + extra_loss + 0.01 * (
-						target_criterion(wt1[:, -1:], s_t) + target_criterion(wt2[:, -1:], s_t) +
-						target_criterion(wt3[:, -1:], s_t) + target_criterion(wt4[:, -1:], s_t) +
-						target_criterion(wa[:, -1:], s_t) + target_criterion(wv[:, -1:], s_t))
-			loss = loss + 0.01 * (
-					target_criterion(pt1[:, -1:], s_t) + target_criterion(pt2[:, -1:], s_t) +
-					target_criterion(pt3[:, -1:], s_t) + target_criterion(pt4[:, -1:], s_t) +
-					target_criterion(pa[:, -1:], s_t) + target_criterion(pv[:, -1:], s_t))
+		# 璁＄畻鍩虹 Loss锛堝惈 RRA/MEB extra_loss锛?
+			# 璁＄畻鍩虹 Loss锛堝惈 RRA/MEB extra_loss锛?
+			main_loss = loss_function(log_prob, label)
+			aux_loss = extra_loss
+			sgf_weight_loss = 0.01 * (
+							target_criterion(wt1[:, -1:], s_t) + target_criterion(wt2[:, -1:], s_t) +
+							target_criterion(wt3[:, -1:], s_t) + target_criterion(wt4[:, -1:], s_t) +
+							target_criterion(wa[:, -1:], s_t) + target_criterion(wv[:, -1:], s_t))
+			sgf_anchor_loss = 0.01 * (
+							target_criterion(pt1[:, -1:], s_t) + target_criterion(pt2[:, -1:], s_t) +
+							target_criterion(pt3[:, -1:], s_t) + target_criterion(pt4[:, -1:], s_t) +
+							target_criterion(pa[:, -1:], s_t) + target_criterion(pv[:, -1:], s_t))
 
-				# ---------------- 修复：缩进正确，批量计算辅助 Loss ----------------
+				# ---------------- 淇锛氱缉杩涙纭紝鎵归噺璁＄畻杈呭姪 Loss ----------------
 			num_labels = len(data_labels)
-			# 生成单个节点内部的原型标签 [12]
+			# 鐢熸垚鍗曚釜鑺傜偣鍐呴儴鐨勫師鍨嬫爣绛?[12]
 			ss_t_base = torch.tensor([i for i in range(len(data_speakers)) for _ in range(num_labels)],
 									 dtype=torch.float32, device=pt1.device)
 
-			# 提取 [N, 12, Dim] 形状的原型特征
+			# 鎻愬彇 [N, 12, Dim] 褰㈢姸鐨勫師鍨嬬壒寰?
 			pt1_proto = pt1[:, :-1, :]
 			pt2_proto = pt2[:, :-1, :]
 			pt3_proto = pt3[:, :-1, :]
@@ -478,8 +629,8 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			pa_proto = pa[:, :-1, :]
 			pv_proto = pv[:, :-1, :]
 
-			# 一次性无循环计算所有节点的局部对比损失，严格等价且极速
-			loss = loss + 0.8 * 0.0001 * (
+			# 涓€娆℃€ф棤寰幆璁＄畻鎵€鏈夎妭鐐圭殑灞€閮ㄥ姣旀崯澶憋紝涓ユ牸绛変环涓旀瀬閫?
+			sgf_proto_loss = 0.8 * 0.0001 * (
 					batched_target_criterion(pt1_proto, ss_t_base) +
 					batched_target_criterion(pt2_proto, ss_t_base) +
 					batched_target_criterion(pt3_proto, ss_t_base) +
@@ -487,12 +638,45 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 					batched_target_criterion(pa_proto, ss_t_base) +
 					batched_target_criterion(pv_proto, ss_t_base)
 			)
+			sgf_aux_loss = sgf_weight_loss + sgf_anchor_loss + sgf_proto_loss
+			if train and args.use_aux_grad_balance and aux_loss_dict is not None and model.use_rra and model.use_meb:
+				L_align_raw = aux_loss_dict['L_align_raw']
+				L_meb_raw = aux_loss_dict['L_meb_raw']
+				lambda_meb_sched = aux_loss_dict['lambda_meb_sched']
+				align_loss_scaled = L_align_raw
+				meb_loss_scaled = lambda_meb_sched * L_meb_raw
+				align_anchor = aux_loss_dict.get('rra_balance_anchor')
+				meb_anchor = aux_loss_dict.get('meb_balance_anchor')
+				if args.use_aux_grad_balance_with_sgf:
+					sgf_anchor = _build_sgf_balance_anchor(
+						[pt1, pt2, pt3, pt4, pa, pv],
+						[wt1, wt2, wt3, wt4, wa, wv]
+					)
+					w_align, w_meb, w_sgf, gna, gnm, gns = aux_grad_balancer.compute_three(
+						align_loss_scaled, meb_loss_scaled, sgf_aux_loss,
+						align_anchor, meb_anchor, sgf_anchor, epoch=epoch
+					)
+					aux_loss = (
+						w_align * align_loss_scaled
+						+ w_meb * meb_loss_scaled
+						+ w_sgf * sgf_aux_loss
+					)
+					loss = main_loss + aux_loss
+				else:
+					w_align, w_meb, gna, gnm = aux_grad_balancer.compute(
+						align_loss_scaled, meb_loss_scaled,
+						align_anchor, meb_anchor, epoch=epoch
+					)
+					aux_loss = w_align * align_loss_scaled + w_meb * meb_loss_scaled
+					loss = main_loss + aux_loss + sgf_aux_loss
+			else:
+				loss = main_loss + aux_loss + sgf_aux_loss
 			# -------------------------------------------------------------
 
 			preds.append(torch.argmax(log_prob, 1).cpu().numpy())
 			labels.append(label.cpu().numpy())
 
-			# ---------------- 修复：缩进正确，切片化概率回收 ----------------
+			# ---------------- 淇锛氱缉杩涙纭紝鍒囩墖鍖栨鐜囧洖鏀?----------------
 			log_prob_np = log_prob.data.cpu().numpy()
 			now = 0
 			for i in range(len(umask)):
@@ -504,6 +688,8 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda, mod
 			losses.append(loss.item())
 			if train:
 				loss.backward()
+				torch.nn.utils.clip_grad_norm_(list(_iter_optimizer_params(optimizer)), max_norm=5.0)
+				apply_shallow_grad_tuning(model, min_norm=1e-4, boost=1.1, max_scale=5.0)
 				optimizer.step()
 
 	if preds != []:
@@ -546,7 +732,7 @@ def collect_feature(dataloader, D_text, D_audio, D_visual):
 	textproto, audioproto, visproto = [[0 for _ in range(len(data_speakers))] for _ in range(4)], [0 for _ in range(
 		len(data_speakers))], [0 for _ in range(len(data_speakers))]
 
-	# 修改 1：引入 torch.no_grad()，阻断隐式计算图缓存
+	# 淇敼 1锛氬紩鍏?torch.no_grad()锛岄樆鏂殣寮忚绠楀浘缂撳瓨
 	with torch.no_grad():
 		for data in dataloader:
 			textf = [0 for _ in range(4)]
@@ -572,7 +758,7 @@ def collect_feature(dataloader, D_text, D_audio, D_visual):
 				for j in range(len(speakers[i])):
 					if speakers[i][j] == -1:
 						continue
-					# 修改 2：使用 .cpu() 将大规模特征张量转移到系统内存
+					# 淇敼 2锛氫娇鐢?.cpu() 灏嗗ぇ瑙勬ā鐗瑰緛寮犻噺杞Щ鍒扮郴缁熷唴瀛?
 					for k in range(4):
 						textfeature[k][speakers[i][j]][label[i][j]].append(textf[k][i][j].cpu())
 						ttextf[k].append(textf[k][i][j].cpu())
@@ -582,7 +768,7 @@ def collect_feature(dataloader, D_text, D_audio, D_visual):
 					tvisuf.append(visuf[i][j].cpu())
 
 	k = proto_k
-	# 修改 3：在 CPU 端完成拼接与均值计算，最后仅将结果 Prototype 推送回 GPU
+	# 淇敼 3锛氬湪 CPU 绔畬鎴愭嫾鎺ヤ笌鍧囧€艰绠楋紝鏈€鍚庝粎灏嗙粨鏋?Prototype 鎺ㄩ€佸洖 GPU
 	for i in range(len(data_speakers)):
 		for j in range(4):
 			textproto[j][i] = torch.cat(
@@ -690,21 +876,35 @@ if __name__ == '__main__':
 
     parser.add_argument('--proto_k', type=int, default=2, help='num of prototypes')
 
-    # ---- RRA / MEB 消融实验控制参数 ----
+    # ---- RRA / MEB 娑堣瀺瀹為獙鎺у埗鍙傛暟 ----
     parser.add_argument('--use_rra', action='store_true', default=False,
                         help='Enable Residual Reliability Alignment (RRA) module')
     parser.add_argument('--use_meb', action='store_true', default=False,
                         help='Enable Multi-center Emotion Ball (MEB) module')
+    if hasattr(argparse, 'BooleanOptionalAction'):
+        parser.add_argument('--use_dsu', action=argparse.BooleanOptionalAction, default=True,
+                            help='Enable Distribution Uncertainty (DSU), p fixed at 0.5')
+    else:
+        parser.add_argument('--use_dsu', dest='use_dsu', action='store_true', default=True,
+                            help='Enable Distribution Uncertainty (DSU), p fixed at 0.5')
+        parser.add_argument('--no-use_dsu', dest='use_dsu', action='store_false',
+                            help='Disable Distribution Uncertainty (DSU)')
+    parser.add_argument('--use_aux_grad_balance', action='store_true', default=False,
+                        help='Enable dynamic GradNorm+conflict balancing for RRA/MEB auxiliary losses')
+    parser.add_argument('--use_aux_grad_balance_with_sgf', action='store_true', default=False,
+                        help='Include SGF auxiliary losses in dynamic balancing (requires --use_aux_grad_balance)')
 
-    # ---- 随机种子参数 ----
+    # ---- 闅忔満绉嶅瓙鍙傛暟 ----
     parser.add_argument('--seed', type=int, default=None,
                         help='Override the global random seed (IEMOCAP default=1746, MELD default=67137). '
                              'If not provided, the hardcoded default seed is used.')
 
     args = parser.parse_args()
+    if args.use_aux_grad_balance_with_sgf:
+        args.use_aux_grad_balance = True
     today = datetime.datetime.now()
 
-    # ---- 种子覆盖：如果传入了 --seed，则使用传入值 ----
+    # ---- 绉嶅瓙瑕嗙洊锛氬鏋滀紶鍏ヤ簡 --seed锛屽垯浣跨敤浼犲叆鍊?----
     if args.seed is not None:
         seed = args.seed
     print(args)
@@ -722,6 +922,12 @@ if __name__ == '__main__':
         name_ = name_ + '_RRA'
     if args.use_meb:
         name_ = name_ + '_MEB'
+    if args.use_aux_grad_balance:
+        name_ = name_ + '_AGB'
+    if args.use_aux_grad_balance_with_sgf:
+        name_ = name_ + '_SGFGB'
+    if not args.use_dsu:
+        name_ = name_ + '_NoDSU'
 
     args.cuda = torch.cuda.is_available() and not args.no_cuda
     if args.cuda:
@@ -830,7 +1036,8 @@ if __name__ == '__main__':
                       opn=args.opn,
                       D_text=D_text * 2,
                       use_rra=args.use_rra,
-                      use_meb=args.use_meb)
+                      use_meb=args.use_meb,
+                      use_dsu=args.use_dsu)
 
         print('Graph NN with', args.base_model, 'as base model.')
         name = 'Graph'
@@ -892,7 +1099,7 @@ if __name__ == '__main__':
             else:
                 loss_function = MaskedNLLLoss()
 
-    # ---- Optimizer（model.parameters() 已包含 rra/meb 子模块，无重复） ----
+    # ---- Optimizer锛坢odel.parameters() 宸插寘鍚?rra/meb 瀛愭ā鍧楋紝鏃犻噸澶嶏級 ----
     optimizer = optim.Adam(
         params=chain(model.parameters(), gt1.parameters(), gt2.parameters(), gt3.parameters(), gt4.parameters(),
                      ga.parameters(), gv.parameters()),

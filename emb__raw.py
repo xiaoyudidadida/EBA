@@ -1,12 +1,12 @@
-﻿"""
+"""
 emb.py - SGF-RRA-MEB: Residual Reliability Alignment + Multi-center Emotion Ball
-宸茬粡鍦╩odel.py闆嗘垚
-鍩轰簬 sgf_modified_framework_plan.md 妗嗘灦璁捐鏂囨。瀹炵幇銆?
-鍦?SGF Backbone 鐨?鍓嶅悗"鍚勬彃鍏ヤ竴涓交閲忓寮烘ā鍧?
-    - Module A: RRA (Residual Reliability Alignment) 鈥?鎻掑湪涓夋ā鎬佺紪鐮佷箣鍚庛€丼GF 涓诲共涔嬪墠
-    - Module B: MEB (Multi-center Emotion Ball)     鈥?鎻掑湪 SGF 鏈€缁堣瀺鍚堟儏缁〃绀?z 涔嬪悗銆佸垎绫诲櫒涔嬪墠
+已经在model.py集成
+基于 sgf_modified_framework_plan.md 框架设计文档实现。
+在 SGF Backbone 的"前后"各插入一个轻量增强模块:
+    - Module A: RRA (Residual Reliability Alignment) — 插在三模态编码之后、SGF 主干之前
+    - Module B: MEB (Multi-center Emotion Ball)     — 插在 SGF 最终融合情绪表示 z 之后、分类器之前
 
-鎬绘崯澶? L_total = L_SGF + 位_a * L_align + 位_b * L_meb
+总损失: L_total = L_SGF + λ_a * L_align + λ_b * L_meb
 """
 
 import torch
@@ -17,25 +17,25 @@ import math
 
 
 # ============================================================================
-# Part I: Module A 鈥?Residual Reliability Alignment (RRA)
+# Part I: Module A — Residual Reliability Alignment (RRA)
 # ============================================================================
-# 鎻掑叆浣嶇疆: Text/Audio/Video Encoder 鈫?[RRA] 鈫?Original SGF Backbone
+# 插入位置: Text/Audio/Video Encoder → [RRA] → Original SGF Backbone
 #
-# 鏍稿績璁捐:
-#   1. 缁熶竴鎶曞奖: 灏嗕笁妯℃€佹槧灏勫埌鍚屼竴缁村害 d=256
-#   2. 鍏变韩鍒嗘敮 + 鐗瑰紓鍒嗘敮: [u_i^m; s_i^m] = MLP_m(p_i^m)
-#   3. 涓€鑷存€?+ 鍙潬鎬ф墦鍒? r_i^m = MLP_r([g_bar_i^m, q_i^m])
-#   4. 娈嬪樊寮忛噸鏍囧畾: h_tilde_i^m = p_i^m + alpha_i^m * W_o^m * [u_i^m || s_i^m]
+# 核心设计:
+#   1. 统一投影: 将三模态映射到同一维度 d=256
+#   2. 共享分支 + 特异分支: [u_i^m; s_i^m] = MLP_m(p_i^m)
+#   3. 一致性 + 可靠性打分: r_i^m = MLP_r([g_bar_i^m, q_i^m])
+#   4. 残差式重标定: h_tilde_i^m = p_i^m + alpha_i^m * W_o^m * [u_i^m || s_i^m]
 # ============================================================================
 
 
 class UnifiedProjection(nn.Module):
     """
-    Step 1: 灏嗕笁妯℃€佸垎鍒姇褰卞埌缁熶竴缁村害 d
+    Step 1: 将三模态分别投影到统一维度 d
 
     Args:
-        modal_dim:      鍚勬ā鎬佸師濮嬬壒寰佺淮搴?(dict: {'t': dim_t, 'a': dim_a, 'v': dim_v})
-        unified_dim:    缁熶竴鎶曞奖缁村害锛岄粯璁や负 256锛堣妗嗘灦鏂囨。鎺ㄨ崘鍊硷級
+        modal_dim:      各模态原始特征维度 (dict: {'t': dim_t, 'a': dim_a, 'v': dim_v})
+        unified_dim:    统一投影维度，默认为 256（见框架文档推荐值）
     """
 
     def __init__(self, modal_dim: dict, unified_dim: int = 256):
@@ -48,11 +48,11 @@ class UnifiedProjection(nn.Module):
     def forward(self, h_t=None, h_a=None, h_v=None):
         """
         Args:
-            h_t: Text 鐗瑰緛, shape [seq_len, batch, dim] 鎴?[N, dim]
-            h_a: Audio 鐗瑰緛
-            h_v: Video 鐗瑰緛
+            h_t: Text 特征, shape [seq_len, batch, dim] 或 [N, dim]
+            h_a: Audio 特征
+            h_v: Video 特征
         Returns:
-            dict: {'t': p_t, 'a': p_a, 'v': p_v}, 鍧囦负 [*, unified_dim]
+            dict: {'t': p_t, 'a': p_a, 'v': p_v}, 均为 [*, unified_dim]
         """
         out = {}
         if h_t is not None and self.proj_t is not None:
@@ -63,18 +63,19 @@ class UnifiedProjection(nn.Module):
             out['v'] = self.proj_v(h_v)
         return out
 
+
 class SharedSpecificBranch(nn.Module):
     """
-    Step 2: 姣忎釜妯℃€佹媶鍒嗘垚 shared branch (u) + specific branch (s)
+    Step 2: 每个模态拆分成 shared branch (u) + specific branch (s)
         [u_i^m; s_i^m] = MLP_m(p_i^m)
 
-    shared 鍒嗘敮璐熻矗璺ㄦā鎬佸榻愶紝specific 鍒嗘敮淇濈暀妯℃€佺壒寮備俊鎭€?
+    shared 分支负责跨模态对齐，specific 分支保留模态特异信息。
 
-    鍚屾椂棰濆缁存姢涓€涓交閲?AV 瀛愬叡浜垎鏀紝涓撻棬鎹曡幏闊抽-瑙嗛鐨勯潪璇█鎯呯华鍗忓悓绾跨储銆?
+    同时额外维护一个轻量 AV 子共享分支，专门捕获音频-视频的非语言情绪协同线索。
 
     Args:
-        unified_dim: 缁熶竴鎶曞奖缁村害
-        branch_dim:   姣忎釜鍒嗘敮鐨勭淮搴?(shared + specific 鍚勫崰涓€鍗?
+        unified_dim: 统一投影维度
+        branch_dim:   每个分支的维度 (shared + specific 各占一半)
     """
 
     def __init__(self, unified_dim: int = 256, branch_dim: int = 128):
@@ -82,16 +83,16 @@ class SharedSpecificBranch(nn.Module):
         half = unified_dim // 2
         self.shared_dim = half
         self.specific_dim = unified_dim - half
-        # AV 瀛愬叡浜垎鏀淮搴?
+        # AV 子共享分支维度
         self.subshared_dim = unified_dim // 4
         self.proj_sub_a = nn.Linear(unified_dim, self.subshared_dim)
         self.proj_sub_v = nn.Linear(unified_dim, self.subshared_dim)
-        # 姣忎釜妯℃€佸悇鏈変竴涓?MLP
+        # 每个模态各有一个 MLP
         self.mlp_t = nn.Linear(unified_dim, unified_dim)
         self.mlp_a = nn.Linear(unified_dim, unified_dim)
         self.mlp_v = nn.Linear(unified_dim, unified_dim)
 
-        # 杈撳嚭鎶曞奖
+        # 输出投影
         self.proj_shared_t = nn.Linear(unified_dim, self.shared_dim)
         self.proj_shared_a = nn.Linear(unified_dim, self.shared_dim)
         self.proj_shared_v = nn.Linear(unified_dim, self.shared_dim)
@@ -105,9 +106,9 @@ class SharedSpecificBranch(nn.Module):
         Args:
             p_dict: {'t': p_t, 'a': p_a, 'v': p_v}, shape [*, unified_dim]
         Returns:
-            u_dict: shared branch 杈撳嚭
-            s_dict: specific branch 杈撳嚭
-            sub_dict: AV 瀛愬叡浜垎鏀緭鍑?{'a': sub_a, 'v': sub_v}锛宼 涓?None
+            u_dict: shared branch 输出
+            s_dict: specific branch 输出
+            sub_dict: AV 子共享分支输出 {'a': sub_a, 'v': sub_v}，t 为 None
         """
         u_dict, s_dict, sub_dict = {}, {}, {}
 
@@ -135,50 +136,44 @@ class ReliabilityScorer(nn.Module):
     def __init__(self, branch_dim: int = 128, quality_dim: int = 1):
         super().__init__()
         # input = [sim_ta, sim_tv, q] for text; [sim_ta/sim_tv, sim_av_sub, q] for a/v
-        in_dim = 2 + quality_dim  # 2 涓浉浼煎害 + 1 涓川閲?= 3
+        in_dim = 2 + quality_dim  # 2 个相似度 + 1 个质量 = 3
 
         self.scorer_t = nn.Sequential(
             nn.Linear(in_dim, 64),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(64, 1)
         )
         self.scorer_a = nn.Sequential(
             nn.Linear(in_dim, 64),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(64, 1)
         )
         self.scorer_v = nn.Sequential(
             nn.Linear(in_dim, 64),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(64, 1)
         )
-        # Text-leading bias to avoid all-modalities cold-start competition.
-        self.bias_t = nn.Parameter(torch.tensor(0.8))
-        self.bias_av = nn.Parameter(torch.tensor(-0.4))
 
     def _compute_quality(self, u: torch.Tensor) -> torch.Tensor:
         """
-        璐ㄩ噺鎸囨爣 q_i^m: 浣跨敤鐗瑰緛 L2 norm 浣滀负绠€鍗曠疆淇″害
+        质量指标 q_i^m: 使用特征 L2 norm 作为简单置信度
 
         Args:
-            u: shared branch 杈撳嚭, shape [N, branch_dim]
+            u: shared branch 输出, shape [N, branch_dim]
         Returns:
-            q: 璐ㄩ噺鍒嗘暟, shape [N, 1]
+            q: 质量分数, shape [N, 1]
         """
-        # Use a bounded, dimension-aware quality score so the norm term does not
-        # dominate cosine features when branch activations drift in scale.
-        scale = math.sqrt(max(u.size(-1), 1))
-        return torch.tanh(u.norm(dim=-1, keepdim=True) / (scale + 1e-6))
+        return u.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
     def _compute_cross_similarity(self, u_t: torch.Tensor, u_a: torch.Tensor, u_v: torch.Tensor):
         """
-        璁＄畻妯℃€佸涔嬮棿鐨?cosine 鐩镐技搴?
+        计算模态对之间的 cosine 相似度
 
         Returns:
-            g_ta, g_tv, g_av: 姣忓鐨?cosine 鐩镐技搴?
-            g_bar_t, g_bar_a, g_bar_v: 姣忎釜妯℃€佷笌鍙﹀涓ゆā鎬佺殑骞冲潎鐩镐技搴?
+            g_ta, g_tv, g_av: 每对的 cosine 相似度
+            g_bar_t, g_bar_a, g_bar_v: 每个模态与另外两模态的平均相似度
         """
-        # 褰掍竴鍖?
+        # 归一化
         u_t_norm = F.normalize(u_t, dim=-1)
         u_a_norm = F.normalize(u_a, dim=-1)
         u_v_norm = F.normalize(u_v, dim=-1)
@@ -196,16 +191,16 @@ class ReliabilityScorer(nn.Module):
     def forward(self, u_dict: dict, s_dict: dict = None,
                 sub_dict: dict = None, sim_av_sub: torch.Tensor = None):
         """
-        鍗囩骇鍚庣殑 scorer锛氭枃鏈湅涓庝袱杈圭殑涓€鑷存€э紝闊宠棰戦澶栫湅 AV 瀛愬叡浜竴鑷存€с€?
+        升级后的 scorer：文本看与两边的一致性，音视频额外看 AV 子共享一致性。
 
         Args:
-            u_dict: shared branch 杈撳嚭
-            s_dict: specific branch 杈撳嚭锛堟湭浣跨敤锛?
-            sub_dict: AV 瀛愬叡浜垎鏀緭鍑?{'a': sub_a, 'v': sub_v}
-            sim_av_sub: 棰勮绠楃殑 AV 瀛愬叡浜浉浼煎害 [N, 1]锛岀敤浜?a/v 鐨?scorer 杈撳叆
+            u_dict: shared branch 输出
+            s_dict: specific branch 输出（未使用）
+            sub_dict: AV 子共享分支输出 {'a': sub_a, 'v': sub_v}
+            sim_av_sub: 预计算的 AV 子共享相似度 [N, 1]，用于 a/v 的 scorer 输入
         Returns:
-            alpha: 鍙潬鎬ф潈閲?[N, 3]
-            r_dict: 鍘熷璇勫垎
+            alpha: 可靠性权重 [N, 3]
+            r_dict: 原始评分
         """
         device = next(iter(u_dict.values())).device
         N = next(iter(u_dict.values())).size(0)
@@ -219,7 +214,7 @@ class ReliabilityScorer(nn.Module):
                 q_m = self._compute_quality(u)
 
                 if m == 't':
-                    # 鏂囨湰锛氱湅涓?audio 鍜?video 鐨勪竴鑷存€?
+                    # 文本：看与 audio 和 video 的一致性
                     g_ta = torch.zeros_like(q_m)
                     g_tv = torch.zeros_like(q_m)
                     u_norm = F.normalize(u, dim=-1)
@@ -232,7 +227,7 @@ class ReliabilityScorer(nn.Module):
                     scorer_input = torch.cat([g_ta, g_tv, q_m], dim=-1)
 
                 elif m == 'a':
-                    # 闊抽锛氱湅涓庢枃鏈殑涓€鑷存€?+ AV 瀛愬叡浜竴鑷存€?
+                    # 音频：看与文本的一致性 + AV 子共享一致性
                     g_ta = torch.zeros_like(q_m)
                     u_norm = F.normalize(u, dim=-1)
                     if 't' in u_dict:
@@ -242,7 +237,7 @@ class ReliabilityScorer(nn.Module):
                     scorer_input = torch.cat([g_ta, g_av_sub, q_m], dim=-1)
 
                 elif m == 'v':
-                    # 瑙嗛锛氱湅涓庢枃鏈殑涓€鑷存€?+ AV 瀛愬叡浜竴鑷存€?
+                    # 视频：看与文本的一致性 + AV 子共享一致性
                     g_tv = torch.zeros_like(q_m)
                     u_norm = F.normalize(u, dim=-1)
                     if 't' in u_dict:
@@ -253,44 +248,35 @@ class ReliabilityScorer(nn.Module):
 
                 scorer = getattr(self, f'scorer_{m}')
                 r_m = scorer(scorer_input)
+                alpha_m = torch.sigmoid(r_m)
 
-                alpha_list.append(torch.sigmoid(r_m))
+                alpha_list.append(alpha_m)
                 r_dict[m] = r_m
             else:
                 alpha_list.append(torch.zeros(N, 1, device=device))
 
         alpha = torch.cat(alpha_list, dim=-1)
 
-        # 銆愪袱绾ч棬鎺с€戯細鏇夸唬涓夋ā鎬佹€?softmax锛岄伩鍏嶆枃鏈帇鍒堕煶瑙嗛
-        # 1. 鎻愬彇鍘熷 logit
-        bias_t = 0.8 * torch.tanh(self.bias_t)
-        bias_av = 0.5 * torch.tanh(self.bias_av)
-        r_t = r_dict.get('t', torch.zeros(N, 1, device=device)) + bias_t
-        r_a = r_dict.get('a', torch.zeros(N, 1, device=device)) + bias_av
-        r_v = r_dict.get('v', torch.zeros(N, 1, device=device)) + bias_av
+        # 【两级门控】：替代三模态总 softmax，避免文本压制音视频
+        # 1. 提取原始 logit
+        r_t = r_dict.get('t', torch.zeros(N, 1, device=device))
+        r_a = r_dict.get('a', torch.zeros(N, 1, device=device))
+        r_v = r_dict.get('v', torch.zeros(N, 1, device=device))
 
-        # 2. 鏂囨湰鍗曠嫭闂ㄦ帶锛堜笉鍙備笌绔炰簤锛?
+        # 2. 文本单独门控（不参与竞争）
         g_t = torch.sigmoid(r_t)
 
-        # 3. AV overall reliability: blend shared-branch agreement and sub-branch
-        # agreement so A/V is not opened by a single noisy cue.
-        g_av_shared = torch.zeros_like(g_t)
-        if 'a' in u_dict and 'v' in u_dict and u_dict['a'] is not None and u_dict['v'] is not None:
-            u_a_norm = F.normalize(u_dict['a'], dim=-1)
-            u_v_norm = F.normalize(u_dict['v'], dim=-1)
-            g_av_shared = (u_a_norm * u_v_norm).sum(dim=-1, keepdim=True)
-        g_av_sub = sim_av_sub if sim_av_sub is not None else torch.zeros_like(g_t)
-        g_av = 0.5 * torch.sigmoid(g_av_shared) + 0.5 * torch.sigmoid(g_av_sub)
+        # 3. AV 对子整体可靠性
+        g_av = (sim_av_sub + 1.0) / 2.0
 
-        # 4. A/V 鍐呴儴 softmax 绔炰簤
-        tau_gating = 0.8
+        # 4. A/V 内部 softmax 竞争
+        tau_gating = 0.5
         w_av = F.softmax(torch.cat([r_a, r_v], dim=-1) / tau_gating, dim=-1)
 
-        # 5. Keep text as the leader, but reduce the hard floor so AV still has a
-        # chance to contribute when it is consistently reliable.
-        alpha_t = (0.55 + 0.30 * g_t).clamp(max=0.88)
-        alpha_a = (0.12 + 0.38 * g_av * w_av[:, 0:1]).clamp(max=0.58)
-        alpha_v = (0.12 + 0.38 * g_av * w_av[:, 1:2]).clamp(max=0.58)
+        # 5. 组合最终权重（给 a/v 保底，不让文本无限压制）
+        alpha_t = (0.55 + 0.30 * g_t).clamp(max=0.95)
+        alpha_a = (0.10 + 0.35 * g_av * w_av[:, 0:1]).clamp(max=0.95)
+        alpha_v = (0.10 + 0.35 * g_av * w_av[:, 1:2]).clamp(max=0.95)
 
         alpha = torch.cat([alpha_t, alpha_a, alpha_v], dim=-1)
         return alpha, r_dict
@@ -307,7 +293,7 @@ class ResidualReliabilityAlignment(nn.Module):
         self.branch = SharedSpecificBranch(unified_dim)
         self.scorer = ReliabilityScorer(branch_dim=unified_dim // 2)
 
-        # 銆愭牳蹇冧慨鏀?1銆戯細杈撳嚭灞傚繀椤绘槧灏勫洖鍚勪釜妯℃€佺殑鈥滃師濮嬬淮搴︹€?
+        # 【核心修改 1】：输出层必须映射回各个模态的“原始维度”
         branch_out_dim = unified_dim // 2 + (unified_dim - unified_dim // 2)
         self.output_proj_t = nn.Linear(branch_out_dim, modal_dim['t']) if 't' in modal_dim else None
         self.output_proj_a = nn.Linear(branch_out_dim, modal_dim['a']) if 'a' in modal_dim else None
@@ -317,39 +303,26 @@ class ResidualReliabilityAlignment(nn.Module):
         self.dropout_a = nn.Dropout(0.1)
         self.dropout_v = nn.Dropout(0.1)
 
-        # Keep original residual init for AV paths.
+        # 可学习的残差缩放因子 (零初始化)，gamma_t 初始等价 baseline
+        # self.gamma_t = nn.Parameter(torch.tensor([0.05]))
         self.gamma_a = nn.Parameter(torch.zeros(1))
         self.gamma_v = nn.Parameter(torch.zeros(1))
 
-        # RRA 鎹熷け鏉冮噸
+        # RRA 损失权重
         self.lambda_nce = 0.05
         self.lambda_ortho = 1.0
         self.lambda_hsic = 0.00
         self.lambda_pair = 0.01
-
-    @staticmethod
-    def _build_balance_anchor(u_dict: dict, s_dict: dict, sub_dict: dict = None):
-        parts = []
-        for m in ['t', 'a', 'v']:
-            if m in u_dict and u_dict[m] is not None:
-                parts.append(u_dict[m])
-            if m in s_dict and s_dict[m] is not None:
-                parts.append(s_dict[m])
-            if sub_dict is not None and m in sub_dict and sub_dict[m] is not None:
-                parts.append(sub_dict[m])
-        if len(parts) == 0:
-            return None
-        return torch.cat(parts, dim=-1)
 
     def forward(self, h_t=None, h_a=None, h_v=None,
                 speaker_ids=None, return_align_loss: bool = False):
         p_dict = self.projection(h_t=h_t, h_a=h_a, h_v=h_v)
         u_dict, s_dict, sub_dict = self.branch(p_dict)
 
-        # 璁＄畻 AV 瀛愬叡浜浉浼煎害锛堢敤浜?scorer 鍜屽悗缁袱绾ч棬鎺э級
+        # 计算 AV 子共享相似度（用于 scorer 和后续两级门控）
         device = next(iter(u_dict.values())).device
         N = next(iter(u_dict.values())).size(0)
-        sim_av_sub = torch.zeros(N, 1, device=device)  # 蹇呴』鏄?[N,1] 涓?q_m 缁村害鍖归厤
+        sim_av_sub = torch.zeros(N, 1, device=device)  # 必须是 [N,1] 与 q_m 维度匹配
         if 'a' in sub_dict and 'v' in sub_dict and sub_dict['a'] is not None and sub_dict['v'] is not None:
             sub_a_norm = F.normalize(sub_dict['a'], dim=-1)
             sub_v_norm = F.normalize(sub_dict['v'], dim=-1)
@@ -380,91 +353,90 @@ class ResidualReliabilityAlignment(nn.Module):
 
             h_tilde_dict[m] = h_tilde
 
-        # 浼犲叆 u_dict, s_dict, sub_dict 璁＄畻鏂版崯澶?
+        # 传入 u_dict, s_dict, sub_dict 计算新损失
         L_align = self._compute_rra_loss(u_dict, s_dict, sub_dict,
                                          speaker_ids) if self.use_align_loss else torch.tensor(0.0, device=next(
             iter(p_dict.values())).device)
 
         if return_align_loss:
-            balance_anchor = self._build_balance_anchor(u_dict, s_dict, sub_dict)
-            return h_tilde_dict, L_align, alpha, sim_av_sub, r_dict, balance_anchor
+            return h_tilde_dict, L_align, alpha, sim_av_sub, r_dict
         return h_tilde_dict, alpha, sim_av_sub, r_dict
 
     # def _compute_hsic(self, u: torch.Tensor, s: torch.Tensor):
-    #     """Linear HSIC: HSIC(u,s) = E[uu']E[ss'] 鐨?trace"""
+    #     """Linear HSIC: HSIC(u,s) = E[uu']E[ss'] 的 trace"""
     #     N = u.size(0)
     #     K_u = u @ u.t() / N
     #     K_s = s @ s.t() / N
     #     return (K_u * K_s).sum() / (N * N)
     def _compute_hsic(self, u: torch.Tensor, s: torch.Tensor, sigma: float = 1.0):
         """
-        鍩轰簬 RBF (Radial Basis Function) 鏍稿嚱鏁扮殑 HSIC 璁＄畻銆?
-        鐩爣: 閫氳繃鏄犲皠鍒版棤闄愮淮 RKHS锛屼弗鏍兼儵缃?shared (u) 鍜?specific (s) 涔嬮棿鐨勯潪绾挎€т緷璧栥€?
+        基于 RBF (Radial Basis Function) 核函数的 HSIC 计算。
+        目标: 通过映射到无限维 RKHS，严格惩罚 shared (u) 和 specific (s) 之间的非线性依赖。
         """
         N = u.size(0)
-        # 褰?batch size 鏋佸皬鏃讹紝璁＄畻 HSIC 鏃犵粺璁″鎰忎箟锛岀洿鎺ユ埅鏂?
+        # 当 batch size 极小时，计算 HSIC 无统计学意义，直接截断
         if N < 2:
             return torch.tensor(0.0, device=u.device)
 
-        # 涓轰簡淇濊瘉 RBF 鏍歌绠楃殑鏁板€肩ǔ瀹氭€т笌灏哄害缁熶竴锛屽己鍒惰繘琛?L2 褰掍竴鍖?
+        # 为了保证 RBF 核计算的数值稳定性与尺度统一，强制进行 L2 归一化
         u_norm = F.normalize(u, dim=-1)
         s_norm = F.normalize(s, dim=-1)
 
         def get_rbf_kernel(x, sig):
-            # 楂樻晥璁＄畻娆у紡璺濈骞虫柟鐭╅樀: ||x_i - x_j||^2 = ||x_i||^2 + ||x_j||^2 - 2<x_i, x_j>
+            # 高效计算欧式距离平方矩阵: ||x_i - x_j||^2 = ||x_i||^2 + ||x_j||^2 - 2<x_i, x_j>
             x_sq = (x ** 2).sum(dim=1).view(-1, 1)
             dist_sq = x_sq + x_sq.view(1, -1) - 2.0 * torch.mm(x, x.t())
-            # 寮曞叆 clamp 鎴柇鐢变簬娴偣绮惧害璇樊瀵艰嚧鐨勫井灏忚礋鏁帮紝淇濊瘉璺濈闈炶礋
+            # 引入 clamp 截断由于浮点精度误差导致的微小负数，保证距离非负
             dist_sq = torch.clamp(dist_sq, min=0.0)
-            # 鐢熸垚 RBF 鏍哥煩闃?
+            # 生成 RBF 核矩阵
             K = torch.exp(-dist_sq / (2.0 * sig ** 2))
             return K
 
-        # 璁＄畻鏍哥煩闃?(榛樿 sigma=1.0锛屽洜涓鸿緭鍏ュ凡褰掍竴鍖栵紝鏈€澶ц窛绂诲钩鏂逛负 4)
+        # 计算核矩阵 (默认 sigma=1.0，因为输入已归一化，最大距离平方为 4)
         K_u = get_rbf_kernel(u_norm, sigma)
         K_s = get_rbf_kernel(s_norm, sigma)
 
-        # 鏋勯€犱腑蹇冨寲鐭╅樀 H = I - 1/N * (1 1^T)
+        # 构造中心化矩阵 H = I - 1/N * (1 1^T)
         H = torch.eye(N, device=u.device) - torch.ones((N, N), device=u.device) / float(N)
 
-        # 璁＄畻涓績鍖栧悗鐨勬牳鐭╅樀 Kc = H * K * H
+        # 计算中心化后的核矩阵 Kc = H * K * H
         Kc_u = torch.mm(torch.mm(H, K_u), H)
         Kc_s = torch.mm(torch.mm(H, K_s), H)
 
-        # 璁＄畻 HSIC 缁忛獙浼拌鍊? Tr(Kc_u * Kc_s) / (N-1)^2
+        # 计算 HSIC 经验估计值: Tr(Kc_u * Kc_s) / (N-1)^2
         hsic_value = torch.trace(torch.mm(Kc_u, Kc_s)) / ((N - 1) ** 2)
 
         return hsic_value
 
     def _compute_rra_loss(self, u_dict: dict, s_dict: dict, sub_dict: dict = None, speaker_ids=None):
         """
-        鏈€鏂版ā鎬佸榻愭敼杩涳細闈炲绉?InfoNCE 杞榻?+ 鍏变韩/鐗瑰紓鍒嗘敮姝ｄ氦瑙ｈ€?+ AV 瀛愬叡浜榻?
+        最新模态对齐改进：非对称 InfoNCE 软对齐 + 共享/特异分支正交解耦 + AV 子共享对齐
         """
         device = next(iter(u_dict.values())).device
         N = next(iter(u_dict.values())).size(0)
 
-        # 1. L_ortho: 姝ｄ氦绾︽潫锛屽己鍒?shared(u) 鍜?specific(s) 鎹曡幏涓嶅悓缁村害鐨勪俊鎭?
+        # 1. L_ortho: 正交约束，强制 shared(u) 和 specific(s) 捕获不同维度的信息
         L_ortho = torch.tensor(0.0, device=device)
         for m in u_dict.keys():
             u = F.normalize(u_dict[m], dim=-1)
             s = F.normalize(s_dict[m], dim=-1)
             L_ortho += (u * s).sum(dim=-1).pow(2).mean()
 
-        # 2. L_nce: 璺ㄦā鎬佸姣斿榻?(Asymmetric InfoNCE)
+        # 2. L_nce: 跨模态对比对齐 (Asymmetric InfoNCE)
         L_nce = torch.tensor(0.0, device=device)
-        tau = 0.1  # 瀵规瘮娓╁害
+        tau = 0.1  # 对比温度
         labels = torch.arange(N, device=device)
 
-        # 纭珛鏂囨湰 't' 涓虹粷瀵归敋鐐?(Anchor)
+        # 确立文本 't' 为绝对锚点 (Anchor)
         if 't' in u_dict:
-            # 銆愬叧閿€戯細detach() 褰诲簳闃绘柇寮辨ā鎬佸寮烘ā鎬佺殑鍙嶅悜姹℃煋
+            # 【关键】：detach() 彻底阻断弱模态对强模态的反向污染
             u_t_anchor = F.normalize(u_dict['t'].detach(), dim=-1)
 
             count = 0
             for m in ['a', 'v']:
                 if m in u_dict:
                     u_m = F.normalize(u_dict[m], dim=-1)
-                    # 璁＄畻鍗曞悜鐩镐技搴︾煩闃?[N, N]
+                    # 计算单向相似度矩阵 [N, N]
                     logits = torch.matmul(u_m, u_t_anchor.t()) / tau
                     L_nce += F.cross_entropy(logits, labels)
                     count += 1
@@ -472,14 +444,14 @@ class ResidualReliabilityAlignment(nn.Module):
             if count > 0:
                 L_nce = L_nce / count
         else:
-            # 闄嶇骇鏂规锛堣嫢鏃犳枃鏈級锛氬弻鍚?InfoNCE
+            # 降级方案（若无文本）：双向 InfoNCE
             m1, m2 = list(u_dict.keys())[0], list(u_dict.keys())[1]
             u1, u2 = F.normalize(u_dict[m1], dim=-1), F.normalize(u_dict[m2], dim=-1)
             logits = torch.matmul(u1, u2.t()) / tau
             L_nce = F.cross_entropy(logits, labels)
 
-        # 3. L_pair: AV 瀛愬叡浜榻愶紙TSD 鏍稿績锛氭崟鑾烽潪璇█鎯呯华鍗忓悓绾跨储锛?
-        # 銆愪慨澶嶃€戯細绉婚櫎 .detach()锛屽厑璁告搴﹀洖浼犲埌 proj_sub_a / proj_sub_v
+        # 3. L_pair: AV 子共享对齐（TSD 核心：捕获非语言情绪协同线索）
+        # 【修复】：移除 .detach()，允许梯度回传到 proj_sub_a / proj_sub_v
         L_pair = torch.tensor(0.0, device=device)
         if sub_dict is not None and 'a' in sub_dict and 'v' in sub_dict:
             if sub_dict['a'] is not None and sub_dict['v'] is not None:
@@ -488,7 +460,7 @@ class ResidualReliabilityAlignment(nn.Module):
                 pair_logits = torch.matmul(sub_a_norm, sub_v_norm.t()) / tau
                 L_pair = F.cross_entropy(pair_logits, labels)
 
-        # 铻嶅悎鎹熷け锛氭浜ょ害鏉?+ 瀵规瘮鎹熷け + HSIC锛堝凡鍏抽棴锛?+ AV瀛愬叡浜榻?
+        # 融合损失：正交约束 + 对比损失 + HSIC（已关闭） + AV子共享对齐
         L_hsic = torch.tensor(0.0, device=device)
         if self.lambda_hsic > 0:
             for m in ['t', 'a', 'v']:
@@ -508,27 +480,27 @@ class ResidualReliabilityAlignment(nn.Module):
 
 
 # ============================================================================
-# Part II: Module B 鈥?Multi-center Emotion Ball (MEB)
+# Part II: Module B — Multi-center Emotion Ball (MEB)
 # ============================================================================
-# 鎻掑叆浣嶇疆: Fused Emotion Representation z 鈫?[MEB] 鈫?Classifier
+# 插入位置: Fused Emotion Representation z → [MEB] → Classifier
 #
-# 鏍稿績璁捐:
-#   - 姣忎釜鎯呯华绫诲埆 k 鏈?K_k 涓悆 (K_k >= 1锛岄粯璁?K_k=2)
-#   - 姣忕悆瀹氫箟涓?(c_{k,j}, R_{k,j}): 鐞冨績 + 鍗婂緞
-#   - 涓夐」鎹熷け: L_intra (绫诲唴绱у噾) + L_overlap (绫婚棿闃查噸鍙? + L_div (澶氱悆闃插缂?
+# 核心设计:
+#   - 每个情绪类别 k 有 K_k 个球 (K_k >= 1，默认 K_k=2)
+#   - 每球定义为 (c_{k,j}, R_{k,j}): 球心 + 半径
+#   - 三项损失: L_intra (类内紧凑) + L_overlap (类间防重叠) + L_div (多球防塌缩)
 #
-# 浣庨绫诲埆鍙€€鍖栦负 K_k=1 (鍗曠悆)锛岄粯璁ゆ瘡绫?K_k=2銆?
+# 低频类别可退化为 K_k=1 (单球)，默认每类 K_k=2。
 # ============================================================================
 
 
 class AngularMultiCenterEmotionBall(nn.Module):
     """
-    Dual-Space MEB with weak residual modulation
-    鐩爣锛?
-        1) 鍦?MEB 鍐呴儴鎶?z 鍒掑垎涓哄叡浜┖闂?z_sh 鍜岀壒寮傜┖闂?z_sp
-        2) 绮掔悆浠呭湪 z_sh 涓婃瀯寤?
-        3) z_sp 鍙仛寮辩害鏉燂紙姝ｄ氦 + 鏂瑰樊锛夛紝涓嶅仛椋庢牸鍋忕Щ
-        4) forward 杩斿洖 z + residual delta_z锛屽紓甯歌繘琛岀殑鏃跺€欏彲鍏抽棴
+    Loss-only Dual-Space MEB
+    目标：
+        1) 在 MEB 内部把 z 划分为共享空间 z_sh 和特异空间 z_sp
+        2) 粒球仅在 z_sh 上构建
+        3) z_sp 只做弱约束（正交 + 方差），不做风格偏移
+        4) forward 返回原始 z，不改写分类输入，只通过 loss 回传约束
     """
 
     def __init__(
@@ -565,44 +537,42 @@ class AngularMultiCenterEmotionBall(nn.Module):
         self.radius_min = radius_min
         self.radius_max = radius_max
 
-        # 1) 鍙岀┖闂村垝鍒嗭細shared / specific
+        # 1) 双空间划分：shared / specific
         self.z_sh_dim = int(z_dim * shared_ratio)
         self.z_sp_dim = z_dim - self.z_sh_dim
 
         self.pre_ln = nn.LayerNorm(z_dim)
 
-        # 鐢ㄥ崟灞傜嚎鎬ф姇褰憋紝閬垮厤浣犲墠闈?MLP 鎵板姩杩囧ぇ
+        # 用单层线性投影，避免你前面 MLP 扰动过大
         self.proj_shared = nn.Linear(z_dim, self.z_sh_dim)
         self.proj_specific = nn.Linear(z_dim, self.z_sp_dim)
         self.proj_sh_to_z = nn.Linear(self.z_sh_dim, z_dim)
-        self.residual_scale = nn.Parameter(torch.tensor(0.05))
-        self.residual_max = 0.25
-        # 2) 鐞冨績鍙缓鍦?shared 绌洪棿
+        # 2) 球心只建在 shared 空间
         self.ball_centers = nn.Parameter(
             torch.randn(n_classes, K_per_class, self.z_sh_dim)
         )
 
-        # torch.zeros 缁忚繃 Sigmoid 鏄犲皠鍚庨粯璁ゅ浜?radius_min 鍜?radius_max 鐨勪腑鐐?
+        # torch.zeros 经过 Sigmoid 映射后默认处于 radius_min 和 radius_max 的中点
         # self.raw_radii = nn.Parameter(
         #     torch.zeros(n_classes, K_per_class)
         # )
-        # EMA 鐩爣鍗婂緞锛氬彧鍋?target锛屼笉鐩存帴纭鐩栧弬鏁?
+        # EMA 目标半径：只做 target，不直接硬覆盖参数
         self.register_buffer(
             "ema_radii",
             torch.ones(n_classes, K_per_class) * 0.2
         )
-        # 妫€楠屾儏鍐?
+        # 检验情况
         self._is_initialized = False
         self.debug_mode = True
-        self.debug_epoch_interval = 10  # 纭繚杩欒瀛樺湪涓旀嫾鍐欎竴鑷?
-        self.last_debug_epoch = -1  # 纭繚杩欒瀛樺湪涓旀嫾鍐欎竴鑷?
+        self.debug_epoch_interval = 10  # 确保这行存在且拼写一致
+        self.last_debug_epoch = -1  # 确保这行存在且拼写一致
         # ============================================================
 
         self.register_buffer("prev_centers", torch.zeros(n_classes, K_per_class, self.z_sh_dim))
         self.register_buffer("prev_radii", torch.ones(n_classes, K_per_class) * 0.2)
 
     # =========================================================
-    # 鍩虹鍑芥暟
+    # 基础函数
     # =========================================================
     def _split_spaces(self, z: torch.Tensor):
         z0 = self.pre_ln(z)
@@ -610,31 +580,19 @@ class AngularMultiCenterEmotionBall(nn.Module):
         z_sp = self.proj_specific(z0)
         return z_sh, z_sp
 
-    def _compute_residual_delta(self, z_sh: torch.Tensor, labels: torch.Tensor):
-        z_norm = F.normalize(z_sh, dim=-1)  # [N, D]
-        c_norm = F.normalize(self.ball_centers, dim=-1)  # [C, K, D]
-        labels = labels.long()
-        centers_lbl = c_norm[labels]  # [N, K, D]
-        sim = torch.einsum('nd,nkd->nk', z_norm, centers_lbl)
-        q = F.softmax(sim / self.tau_b, dim=-1)
-        center_mix = torch.einsum('nk,nkd->nd', q, centers_lbl)
-        delta_sh = center_mix - z_norm
-        delta_z = self.proj_sh_to_z(delta_sh)
-        return delta_z
-
     def _compute_ortho_loss(self, z_sh: torch.Tensor, z_sp: torch.Tensor):
         """
-        璁＄畻 shared 鍜?specific 绌洪棿鐨勬浜ゆ崯澶?(Cross-Correlation)
-        閫氳繃鎯╃綒浜ゅ弶鐩稿叧鐭╅樀鐨?Frobenius 鑼冩暟锛岀‘淇濅袱涓┖闂寸嚎鎬х嫭绔嬶紝涓斿畬缇庡吋瀹圭淮搴︿笉涓€鑷寸殑鎯呭喌銆?
+        计算 shared 和 specific 空间的正交损失 (Cross-Correlation)
+        通过惩罚交叉相关矩阵的 Frobenius 范数，确保两个空间线性独立，且完美兼容维度不一致的情况。
         """
-        # 娌挎壒娆＄淮搴?(Batch, dim=0) 褰掍竴鍖栵紝浣垮緱姣忎釜绁炵粡鍏冨湪褰撳墠 batch 鍐呭悜閲忛暱搴︿负 1
+        # 沿批次维度 (Batch, dim=0) 归一化，使得每个神经元在当前 batch 内向量长度为 1
         z_sh_n = F.normalize(z_sh, p=2, dim=0)
         z_sp_n = F.normalize(z_sp, p=2, dim=0)
 
-        # 璁＄畻浜ゅ弶鐩稿叧鐭╅樀锛屽舰鐘? [D_sh, D_sp]
+        # 计算交叉相关矩阵，形状: [D_sh, D_sp]
         corr_matrix = torch.matmul(z_sh_n.t(), z_sp_n)
 
-        # 鎯╃綒鐩稿叧鎬х煩闃典腑鍏冪礌鐨勫钩鏂瑰潎鍊?
+        # 惩罚相关性矩阵中元素的平方均值
         return corr_matrix.pow(2).mean()
 
     def _compute_specific_var_loss(self, z_sp: torch.Tensor, vmin: float = 0.05):
@@ -670,14 +628,14 @@ class AngularMultiCenterEmotionBall(nn.Module):
         return centers
 
     # =========================================================
-    # 淇濇寔涓?model.py 鍏煎锛氬嚱鏁板悕涓嶅彉
+    # 保持与 model.py 兼容：函数名不变
     # =========================================================
     def _init_ball_centers_kmeans(self, z_features: torch.Tensor, labels: torch.Tensor):
         """
-        淇濈暀鍑芥暟鍚嶄互鍏煎 model.py
-        瀹為檯鍋氭硶锛?
+        保留函数名以兼容 model.py
+        实际做法：
             z -> z_sh -> normalize -> farthest init centers
-            鐒跺悗鍩轰簬绫诲唴鏍锋湰鍒颁腑蹇冪殑杞垎閰嶈窛绂伙紝鍒濆鍖栧崐寰?
+            然后基于类内样本到中心的软分配距离，初始化半径
         """
         with torch.no_grad():
             z_sh, _ = self._split_spaces(z_features)
@@ -697,7 +655,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
 
                 self.ball_centers.data[k] = centers_k
 
-                # ===== 鍗婂緞鍒濆鍖栵細鎸夊綋鍓嶇被鏍锋湰鍒颁腑蹇冪殑杞垎閰嶈窛绂?=====
+                # ===== 半径初始化：按当前类样本到中心的软分配距离 =====
                 sim = torch.matmul(feats_k, centers_k.t())
                 dist = 1.0 - sim
                 q = F.softmax(sim / self.tau_b, dim=-1)
@@ -705,7 +663,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
                 sum_q = q.sum(dim=0) + 1e-6
                 init_r = (q * dist).sum(dim=0) / sum_q
 
-                # 銆愭牳蹇冧慨澶嶏細寤虹珛 5% 鐨勫畨鍏ㄧ紦鍐插甫锛屾嫆缁?Sigmoid 鏋佸€笺€?
+                # 【核心修复：建立 5% 的安全缓冲带，拒绝 Sigmoid 极值】
                 margin = (self.radius_max - self.radius_min) * 0.05
                 safe_min = self.radius_min + margin
                 safe_max = self.radius_max - margin
@@ -713,7 +671,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
                 init_r_safe = torch.clamp(init_r, min=safe_min, max=safe_max)
                 # norm_r = (init_r_safe - self.radius_min) / (self.radius_max - self.radius_min)
                 #
-                # # 姝ゆ椂鍙嶈В鍑虹殑鍙傛暟蹇呭畾钀藉湪 [-2.94, 2.94] 鐨勯珮姊害娲昏穬鍖?
+                # # 此时反解出的参数必定落在 [-2.94, 2.94] 的高梯度活跃区
                 # inverse_sigmoid_r = torch.log(norm_r / (1.0 - norm_r))
                 #
                 # self.raw_radii.data[k] = inverse_sigmoid_r
@@ -721,13 +679,13 @@ class AngularMultiCenterEmotionBall(nn.Module):
             self._is_initialized = True
 
     # =========================================================
-    # shared 绌洪棿涓婄殑瑙掕窛绂荤矑鐞冩崯澶?
+    # shared 空间上的角距离粒球损失
     # =========================================================
     def _compute_shared_ball_loss(
             self,
             z_sh: torch.Tensor,
             labels: torch.Tensor,
-            guidance: torch.Tensor = None,
+            sample_rel: torch.Tensor = None,
             update_radii: bool = True,
     ):
         device = z_sh.device
@@ -736,16 +694,16 @@ class AngularMultiCenterEmotionBall(nn.Module):
         z_norm = F.normalize(z_sh, dim=-1)  # [N, Dsh]
         c_norm = F.normalize(self.ball_centers, dim=-1)  # [C, K, Dsh]
 
-        # 銆愪慨鏀圭偣 1銆戯細浣跨敤 Sigmoid 鏄犲皠锛屼繚璇佸叏灞€瀵兼暟杩炵画
+        # 【修改点 1】：使用 Sigmoid 映射，保证全局导数连续
         radii = self.ema_radii.clone().detach()
 
-        if guidance is None:
-            guidance = torch.ones(batch_size, 1, device=device)
+        if sample_rel is None:
+            sample_rel = torch.ones(batch_size, 1, device=device)
 
         L_intra = torch.tensor(0.0, device=device)
         valid_count = 0
 
-        # 鐢ㄤ簬缁熻 batch 鐨勮蒋鍗婂緞鐩爣
+        # 用于统计 batch 的软半径目标
         sum_q = torch.zeros(self.n_classes, self.K, device=device)
         sum_qd = torch.zeros(self.n_classes, self.K, device=device)
         q_list_for_grad = {k: [] for k in range(self.n_classes)}
@@ -759,56 +717,56 @@ class AngularMultiCenterEmotionBall(nn.Module):
             dist_ik = 1.0 - sim_ik  # [1, K]
             q_ik = F.softmax(sim_ik / self.tau_b, dim=-1)  # [1, K]
 
-            # 鏀堕泦甯︽搴︾殑 q_ik 鐢ㄤ簬璁＄畻淇℃伅鐔?
+            # 收集带梯度的 q_ik 用于计算信息熵
             q_list_for_grad[k].append(q_ik)
 
-            # 銆愪慨澶?銆戯細鍒囨柇 q_ik 鍦ㄦ媺杩戣窛绂绘椂鐨勬嵎寰勬搴?(闃绘柇妯″瀷閫氳繃鏀瑰彉鍒嗛厤鏉ヤ綔寮?
+            # 【修复1】：切断 q_ik 在拉近距离时的捷径梯度 (阻断模型通过改变分配来作弊)
             dist_w = (q_ik.detach() * dist_ik).sum()
 
-            # 銆愪慨澶?銆戯細褰诲簳鍓ュず鍒嗙被鎹熷け鐩存帴鎺ㄩ珮鍗婂緞鐨勬潈闄?(鍗婂緞鍏ㄦ潈浜ょ敱 ema_radii 鍜?L_radius 鎺у埗)
+            # 【修复2】：彻底剥夺分类损失直接推高半径的权限 (半径全权交由 ema_radii 和 L_radius 控制)
             r_w = (q_ik.detach() * radii[k:k + 1]).sum()
 
-            rel_i = guidance[i, 0].detach()
+            rel_i = sample_rel[i, 0].detach()
 
-            # 銆愪慨澶?銆戯細搴熼櫎 Softplus锛屼娇鐢?ReLU 璁惧畾纭竟鐣屻€?
-            # 浠呭湪鐐瑰嚭鐣屾椂浜х敓鎷夎繎鐗瑰緛涓庣悆蹇冪殑姊害锛屼竴鏃﹀叆鐞冿紝姊害涓ユ牸涓?0
+            # 【修复3】：废除 Softplus，使用 ReLU 设定硬边界。
+            # 仅在点出界时产生拉近特征与球心的梯度，一旦入球，梯度严格为 0
             margin_diff = dist_w - r_w.detach()
             L_intra += rel_i * F.relu(margin_diff)
             valid_count += 1
 
             if update_radii and self.training:
-                # 杩欓噷鐨?detach 鏄负浜?EMA锛屼繚鐣欎笉鍔?
+                # 这里的 detach 是为了 EMA，保留不动
                 sum_q[k] += q_ik.detach().squeeze(0)
                 sum_qd[k] += (q_ik.detach() * dist_ik.detach()).squeeze(0)
 
         if valid_count > 0:
             L_intra = L_intra / valid_count
 
-            # ---------- 銆愬叧閿慨姝ｃ€戯細浣跨敤淇濈暀姊害鐨勫垎閰嶇煩闃佃绠?Balance Loss ----------
-            # ---------- 銆愬叧閿慨姝ｃ€戯細鍩轰簬 InfoMax 鐨勫弻閲嶅垎閰嶇喌绾︽潫 ----------
+            # ---------- 【关键修正】：使用保留梯度的分配矩阵计算 Balance Loss ----------
+            # ---------- 【关键修正】：基于 InfoMax 的双重分配熵约束 ----------
         L_balance = torch.tensor(0.0, device=device)
         valid_classes = 0
         for k in range(self.n_classes):
             if len(q_list_for_grad[k]) > 0:
-                # 娌挎壒娆℃嫾鎺ヨ绫荤殑鎵€鏈夎蒋鍒嗛厤 [N_k, K]
+                # 沿批次拼接该类的所有软分配 [N_k, K]
                 q_k_stack = torch.cat(q_list_for_grad[k], dim=0)
 
-                # 1. Marginal Entropy (瀹忚骞宠　): 寮哄埗璇ョ被涓嬬殑澶氫釜鐞冭鍧囧寑浣跨敤锛岄槻鍗曠悆鐙ぇ
+                # 1. Marginal Entropy (宏观平衡): 强制该类下的多个球被均匀使用，防单球独大
                 sum_q_grad = q_k_stack.sum(dim=0)
                 p_k = sum_q_grad / (sum_q_grad.sum() + 1e-8)
                 entropy_marginal = - (p_k * torch.log(p_k + 1e-8)).sum()
 
-                # 2. Conditional Entropy (寰灏栭攼): 寮哄埗姣忎釜鏍锋湰蹇呴』娓呮櫚褰掑睘浜庡叾涓竴涓悆锛岄槻妯℃１涓ゅ彲
+                # 2. Conditional Entropy (微观尖锐): 强制每个样本必须清晰归属于其中一个球，防模棱两可
                 entropy_conditional = - (q_k_stack * torch.log(q_k_stack + 1e-8)).sum(dim=-1).mean()
 
-                # 鐞嗘兂鐘舵€侊細瀹忚鍧囧寑鍒嗗竷 (entropy_marginal 瓒嬭繎 ln(K)), 寰纭畾鎬ф瀬楂?(entropy_conditional 瓒嬭繎 0)
+                # 理想状态：宏观均匀分布 (entropy_marginal 趋近 ln(K)), 微观确定性极高 (entropy_conditional 趋近 0)
                 L_balance += (math.log(self.K) - entropy_marginal) + entropy_conditional
                 valid_classes += 1
 
         if valid_classes > 0:
             L_balance = L_balance / valid_classes
 
-        # ---------- 绫婚棿 overlap ----------
+        # ---------- 类间 overlap ----------
         margin_ov = 0.3
         c_flat = c_norm.view(self.n_classes * self.K, -1)
         sim_matrix = torch.matmul(c_flat, c_flat.t())
@@ -820,7 +778,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
         overlap_penalties = F.relu(sim_matrix - margin_ov) * mask
         L_overlap = overlap_penalties.sum() / (mask.sum() + 1e-6)
 
-        # ---------- 绫诲唴澶氱悆闃插缂?----------
+        # ---------- 类内多球防塌缩 ----------
         margin_div = 0.8
         L_div = torch.tensor(0.0, device=device)
         if self.K > 1:
@@ -833,7 +791,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
                         div_count += 1
             L_div = L_div / max(div_count, 1)
 
-        # ---------- EMA 鍗婂緞鐩爣 ----------
+        # ---------- EMA 半径目标 ----------
         if update_radii and self.training:
             with torch.no_grad():
                 batch_radii = self.ema_radii.clone().detach()
@@ -853,7 +811,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
 
         # L_radius = F.smooth_l1_loss(radii, self.ema_radii.detach())
 
-        # 銆愪慨鏀圭偣 4銆戯細灏?L_balance 鍔犲叆鎬绘崯澶?
+        # 【修改点 4】：将 L_balance 加入总损失
         L_ball_total = (
                 L_intra
                 + self.lambda_overlap * L_overlap
@@ -864,17 +822,17 @@ class AngularMultiCenterEmotionBall(nn.Module):
 
         # ===== debug metrics =====
         with torch.no_grad():
-            # 褰撳墠鏈夋晥鍗婂緞
+            # 当前有效半径
             radii_now = radii.detach()
 
-            # 涓績婕傜Щ / 鍗婂緞婕傜Щ
+            # 中心漂移 / 半径漂移
             center_shift = (c_norm - F.normalize(self.prev_centers + 1e-8, dim=-1)).pow(2).sum(dim=-1).sqrt().mean()
             radius_shift = (radii_now - self.prev_radii).abs().mean()
 
-            # 鍗婂緞涓嶦MA鏄惁璐村悎
+            # 半径与EMA是否贴合
             radius_gap = (radii_now - self.ema_radii).abs().mean()
 
-            # 鏍锋湰鏄惁钀界悆鍐?
+            # 样本是否落球内
             inside_count, total_count = 0.0, 0.0
             assign_entropy = 0.0
 
@@ -896,7 +854,7 @@ class AngularMultiCenterEmotionBall(nn.Module):
             inside_rate = inside_count / max(total_count, 1.0)
             assign_entropy = assign_entropy / max(total_count, 1.0)
 
-            # 淇濆瓨涓婁竴鏃跺埢鍙傛暟
+            # 保存上一时刻参数
             self.prev_centers.copy_(self.ball_centers.data)
             self.prev_radii.copy_(radii_now.data)
 
@@ -913,24 +871,24 @@ class AngularMultiCenterEmotionBall(nn.Module):
             "assign_entropy": torch.tensor(assign_entropy, device=device),
             "r_mean": radii_now.mean(),
             "r_std": radii_now.std(unbiased=False),
-            "usage": L_balance.detach(),  # <--- 灏嗘湭瀹氫箟鐨?L_usage 鏇挎崲涓哄疄闄呰绠楃殑 L_balance
+            "usage": L_balance.detach(),  # <--- 将未定义的 L_usage 替换为实际计算的 L_balance
         }
 
     # =========================================================
-    # 鎬绘崯澶?
+    # 总损失
     # =========================================================
     def _compute_dualspace_meb_loss(
             self,
             z_sh: torch.Tensor,
             z_sp: torch.Tensor,
             labels: torch.Tensor,
-            guidance: torch.Tensor = None,
+            sample_rel: torch.Tensor = None,
             update_radii: bool = True,
     ):
         ball_dict = self._compute_shared_ball_loss(
             z_sh=z_sh,
             labels=labels,
-            guidance=guidance,
+            sample_rel=sample_rel,
             update_radii=update_radii
         )
 
@@ -963,37 +921,29 @@ class AngularMultiCenterEmotionBall(nn.Module):
         }
 
     # =========================================================
-    # forward锛氬彧杩斿洖鍘熷 z锛屼笉鏀瑰垎绫昏緭鍏?
+    # forward：只返回原始 z，不改分类输入
     # =========================================================
     def forward(
             self,
             z: torch.Tensor,
             labels: torch.Tensor = None,
-            guidance: torch.Tensor = None,
+            sample_rel: torch.Tensor = None,
             update_radii: bool = True,
-            epoch: int = None  # <--- 鏂板 epoch 鍙傛暟
+            epoch: int = None  # <--- 新增 epoch 参数
     ):
         z_in = self.dropout(z)
         z_sh, z_sp = self._split_spaces(z_in)
-        z_out = z
 
         L_meb_dict = {"total": torch.tensor(0.0, device=z.device)}
         if labels is not None:
             L_meb_dict = self._compute_dualspace_meb_loss(
                 z_sh=z_sh, z_sp=z_sp, labels=labels,
-                guidance=guidance, update_radii=update_radii
+                sample_rel=sample_rel, update_radii=update_radii
             )
-            delta_z = self._compute_residual_delta(z_sh, labels)
-            scale = torch.clamp(self.residual_scale, min=0.0, max=self.residual_max)
-            if guidance is not None:
-                guide_scale = guidance.clamp(min=0.05, max=1.0).to(z.dtype)
-                z_out = z + (scale * guide_scale) * torch.tanh(delta_z)
-            else:
-                z_out = z + scale * torch.tanh(delta_z)
 
-            # --- 淇敼鐨勮皟璇曞垽鏂€昏緫 ---
+            # --- 修改的调试判断逻辑 ---
             if self.debug_mode and self.training and epoch is not None:
-                # 浠呭綋 epoch 鏄?10 鐨勫€嶆暟锛屼笖璇?epoch 灏氭湭鎵撳嵃杩囨椂瑙﹀彂
+                # 仅当 epoch 是 10 的倍数，且该 epoch 尚未打印过时触发
                 if epoch % self.debug_epoch_interval == 0 and epoch != self.last_debug_epoch:
                     print(
                         f"[MEB-Debug] epoch={epoch} "
@@ -1012,15 +962,15 @@ class AngularMultiCenterEmotionBall(nn.Module):
                         f"r_shift={L_meb_dict['radius_shift'].item():.4f}"
                         f"usage={L_meb_dict['usage'].item():.4f} "
                     )
-                    self.last_debug_epoch = epoch  # 閿佸畾褰撳墠 epoch
+                    self.last_debug_epoch = epoch  # 锁定当前 epoch
             # ------------------------
 
-        return z_out, L_meb_dict
+        return z, L_meb_dict
 
     def get_ball_params(self):
         return {
             "centers": self.ball_centers.data,
-            "radii": self.ema_radii.data,  # 鐩存帴杩斿洖 ema_radii
+            "radii": self.ema_radii.data,  # 直接返回 ema_radii
             "ema_radii": self.ema_radii.data
         }
 
